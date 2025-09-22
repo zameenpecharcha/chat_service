@@ -1,0 +1,7 @@
+service_name: chat-service
+port: 50051
+log_level: info
+redis_addr: ""
+redis_password: ""
+
+

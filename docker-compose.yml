@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  chat-service:
+    build: .
+    environment:
+      - PORT=50060
+      - LOG_LEVEL=info
+      - REDIS_ADDR=redis:6379
+    ports:
+      - "50060:50060"
+    depends_on:
+      - redis
+
+

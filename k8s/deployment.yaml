@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: chat-service
+  template:
+    metadata:
+      labels:
+        app: chat-service
+    spec:
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: chat-service
+        image: atcs1234/zpc:dev
+        ports:
+        - containerPort: 8000
+        env:
+        - name: ENV
+          value: "dev"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "250m"
+        # Add more environment variables as needed

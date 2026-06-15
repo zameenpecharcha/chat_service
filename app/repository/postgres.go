@@ -1,0 +1,273 @@
+package repository
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	_ "github.com/lib/pq"
+)
+
+// RoomMeta mirrors chat.RoomMeta but lives in the repository layer to avoid
+// import cycles. The application maps between the two as needed.
+type RoomMeta struct {
+	RoomID     string
+	RoomType   int    // 0=DM 1=GROUP
+	Name       string // empty for DMs
+	CreatedBy  string // user ID string (matches users.id cast to text)
+	PropertyID *int64 // nullable FK to properties table
+	MemberIDs  []string
+	CreatedAt  time.Time
+}
+
+// RoomRepository persists room metadata and membership in PostgreSQL.
+type RoomRepository struct {
+	db *sql.DB
+}
+
+// NewRoomRepository opens a PostgreSQL connection.
+// dsn example: "host=localhost port=5432 user=root password=secret dbname=zpc sslmode=disable"
+func NewRoomRepository(dsn string) (*RoomRepository, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("postgres open: %w", err)
+	}
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.PingContext(context.Background()); err != nil {
+		return nil, fmt.Errorf("postgres ping: %w", err)
+	}
+	return &RoomRepository{db: db}, nil
+}
+
+// Close releases the database connection pool.
+func (r *RoomRepository) Close() error { return r.db.Close() }
+
+// Migrate creates the chat schema tables if they don't exist yet.
+// Idempotent — safe to call on every startup.
+func (r *RoomRepository) Migrate(ctx context.Context) error {
+	_, err := r.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS chat_rooms (
+			id              TEXT         PRIMARY KEY,
+			room_type       SMALLINT     NOT NULL DEFAULT 0,
+			name            TEXT,
+			created_by      TEXT         NOT NULL CHECK (created_by <> ''),
+			property_id     BIGINT,
+			avatar_url      TEXT,
+			is_archived     BOOLEAN      NOT NULL DEFAULT FALSE,
+			created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+		);
+
+		CREATE TABLE IF NOT EXISTS chat_room_members (
+			room_id         TEXT         NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
+			user_id         TEXT         NOT NULL CHECK (user_id <> ''),
+			role            TEXT         NOT NULL DEFAULT 'member',
+			joined_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			left_at         TIMESTAMPTZ,
+			muted_until     TIMESTAMPTZ,
+			is_pinned       BOOLEAN      NOT NULL DEFAULT FALSE,
+			PRIMARY KEY (room_id, user_id)
+		);
+
+		CREATE TABLE IF NOT EXISTS chat_room_last_activity (
+			room_id          TEXT         PRIMARY KEY REFERENCES chat_rooms(id) ON DELETE CASCADE,
+			last_message_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+			last_message_id  TEXT,
+			last_sender_id   TEXT,
+			preview_text     TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS chat_read_receipts (
+			room_id          TEXT         NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
+			user_id          TEXT         NOT NULL CHECK (user_id <> ''),
+			last_read_at     TIMESTAMPTZ  NOT NULL,
+			last_read_msg_id TEXT,
+			PRIMARY KEY (room_id, user_id)
+		);
+
+		-- Indexes
+		CREATE INDEX IF NOT EXISTS idx_chat_rooms_created_by
+			ON chat_rooms(created_by);
+		CREATE INDEX IF NOT EXISTS idx_chat_members_user
+			ON chat_room_members(user_id) WHERE left_at IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_last_activity_time
+			ON chat_room_last_activity(last_message_at DESC);
+
+		-- Trigger: keep updated_at current on every UPDATE
+		CREATE OR REPLACE FUNCTION trg_set_updated_at()
+		RETURNS TRIGGER LANGUAGE plpgsql AS $trg$
+		BEGIN
+			NEW.updated_at = NOW();
+			RETURN NEW;
+		END;
+		$trg$;
+
+		DROP TRIGGER IF EXISTS set_chat_rooms_updated_at ON chat_rooms;
+		CREATE TRIGGER set_chat_rooms_updated_at
+			BEFORE UPDATE ON chat_rooms
+			FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
+	`)
+	return err
+}
+
+// UpsertRoom inserts a room row (idempotent — ON CONFLICT DO NOTHING).
+func (r *RoomRepository) UpsertRoom(ctx context.Context, m *RoomMeta) error {
+	var propertyID sql.NullInt64
+	if m.PropertyID != nil {
+		propertyID = sql.NullInt64{Int64: *m.PropertyID, Valid: true}
+	}
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO chat_rooms (id, room_type, name, created_by, property_id, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $6)
+		ON CONFLICT (id) DO NOTHING`,
+		m.RoomID, m.RoomType, nullString(m.Name), m.CreatedBy, propertyID, m.CreatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert room: %w", err)
+	}
+	// Upsert all members
+	for _, uid := range m.MemberIDs {
+		if _, err := r.db.ExecContext(ctx, `
+			INSERT INTO chat_room_members (room_id, user_id)
+			VALUES ($1, $2)
+			ON CONFLICT (room_id, user_id) DO NOTHING`,
+			m.RoomID, uid,
+		); err != nil {
+			return fmt.Errorf("upsert member %s: %w", uid, err)
+		}
+	}
+	return nil
+}
+
+// GetRoom returns room metadata and current members.
+func (r *RoomRepository) GetRoom(ctx context.Context, roomID string) (*RoomMeta, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, room_type, COALESCE(name,''), created_by, created_at
+		FROM   chat_rooms
+		WHERE  id = $1`, roomID)
+
+	var m RoomMeta
+	if err := row.Scan(&m.RoomID, &m.RoomType, &m.Name, &m.CreatedBy, &m.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get room: %w", err)
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT user_id FROM chat_room_members
+		WHERE  room_id = $1 AND left_at IS NULL`, roomID)
+	if err != nil {
+		return nil, fmt.Errorf("get members: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		m.MemberIDs = append(m.MemberIDs, uid)
+	}
+	return &m, rows.Err()
+}
+
+// GetOrCreateDM returns the existing DM room for the pair, or creates it.
+// Room ID is deterministic: "dm:<sortedA>:<sortedB>".
+func (r *RoomRepository) GetOrCreateDM(ctx context.Context, userA, userB, createdBy string) (*RoomMeta, error) {
+	ids := []string{userA, userB}
+	sort.Strings(ids)
+	roomID := "dm:" + strings.Join(ids, ":")
+
+	existing, err := r.GetRoom(ctx, roomID)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return existing, nil
+	}
+	m := &RoomMeta{
+		RoomID:    roomID,
+		RoomType:  0,
+		CreatedBy: createdBy,
+		MemberIDs: ids,
+		CreatedAt: time.Now().UTC(),
+	}
+	return m, r.UpsertRoom(ctx, m)
+}
+
+// CreateGroup creates a new group room with a UUID room ID.
+func (r *RoomRepository) CreateGroup(ctx context.Context, roomID, name, createdBy string, memberIDs []string) (*RoomMeta, error) {
+	m := &RoomMeta{
+		RoomID:    roomID,
+		RoomType:  1,
+		Name:      name,
+		CreatedBy: createdBy,
+		MemberIDs: memberIDs,
+		CreatedAt: time.Now().UTC(),
+	}
+	return m, r.UpsertRoom(ctx, m)
+}
+
+// UpdateLastActivity records the most-recent message metadata for a room.
+func (r *RoomRepository) UpdateLastActivity(ctx context.Context,
+	roomID, msgID, senderID, preview string, at time.Time) error {
+
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO chat_room_last_activity
+		  (room_id, last_message_at, last_message_id, last_sender_id, preview_text)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (room_id) DO UPDATE SET
+		  last_message_at = EXCLUDED.last_message_at,
+		  last_message_id = EXCLUDED.last_message_id,
+		  last_sender_id  = EXCLUDED.last_sender_id,
+		  preview_text    = EXCLUDED.preview_text`,
+		roomID, at, msgID, senderID, preview,
+	)
+	return err
+}
+
+// UpdateReadReceipt sets the last-read cursor for a user in a room.
+func (r *RoomRepository) UpdateReadReceipt(ctx context.Context,
+	roomID, userID, msgID string, at time.Time) error {
+
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO chat_read_receipts (room_id, user_id, last_read_at, last_read_msg_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (room_id, user_id) DO UPDATE SET
+		  last_read_at     = EXCLUDED.last_read_at,
+		  last_read_msg_id = EXCLUDED.last_read_msg_id`,
+		roomID, userID, at, msgID,
+	)
+	return err
+}
+
+// GetUserRooms returns all active room IDs a user belongs to.
+func (r *RoomRepository) GetUserRooms(ctx context.Context, userID string) ([]string, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT room_id FROM chat_room_members
+		WHERE  user_id = $1 AND left_at IS NULL`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var roomIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		roomIDs = append(roomIDs, id)
+	}
+	return roomIDs, rows.Err()
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+func nullString(s string) sql.NullString {
+	return sql.NullString{String: s, Valid: s != ""}
+}

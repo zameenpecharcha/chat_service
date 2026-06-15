@@ -4,15 +4,36 @@ services:
     image: redis:7-alpine
     ports: ["6379:6379"]
 
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
   chat-service:
     build: .
     environment:
-      - PORT=50060
+      - PORT=50051
       - LOG_LEVEL=info
       - REDIS_ADDR=redis:6379
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_BUCKET=chat-media
+      - MINIO_USE_SSL=false
     ports:
-      - "50060:50060"
+      - "50051:50051"
     depends_on:
       - redis
+      - minio
+
+volumes:
+  minio_data:
 
 

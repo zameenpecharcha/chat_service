@@ -1,7 +1,47 @@
 service_name: chat-service
 port: 50051
 log_level: info
+
+# ── Redis — leave empty to use in-process broker (single-instance only) ───────
 redis_addr: ""
 redis_password: ""
 
+# ── Object Storage ────────────────────────────────────────────────────────────
+# storage_backend: "minio"   (default — good for local dev with Docker MinIO)
+# storage_backend: "s3"      (AWS S3, Cloudflare R2, DigitalOcean Spaces)
+storage_backend: ""
+
+# MinIO (local dev):  docker run -p 9000:9000 -p 9001:9001 minio/minio server /data --console-address ":9001"
+minio_endpoint: ""          # e.g. "localhost:9000"
+minio_access_key: ""
+minio_secret_key: ""
+minio_bucket: chat-media
+minio_use_ssl: false
+
+# AWS S3 (production):
+s3_bucket: ""               # e.g. "zpc-chat-media-prod"
+s3_region: "us-east-1"
+s3_endpoint: ""             # empty = real AWS; set for R2/Spaces/MinIO via S3 driver
+s3_access_key_id: ""        # or use IAM role (leave empty on EC2/ECS)
+s3_secret_access_key: ""
+s3_force_path_style: false  # set true for MinIO or non-AWS endpoints
+
+# ── Cassandra (message history) ───────────────────────────────────────────────
+# Run schema first:  cqlsh -f schema/cassandra_chat.cql
+# Docker:  docker run -p 9042:9042 --name cassandra cassandra:5
+cassandra_hosts: ""         # e.g. "127.0.0.1"  (comma-separated for cluster)
+cassandra_keyspace: zpc_chat
+cassandra_user: ""
+cassandra_password: ""
+
+# ── PostgreSQL (rooms, members, last-activity) ────────────────────────────────
+# Tables are auto-created on startup (Migrate()) — no separate migration needed.
+postgres_host: ""           # e.g. "localhost"
+postgres_port: 5432
+postgres_user: ""
+postgres_password: ""
+postgres_db: ""             # e.g. "zpc"
+postgres_sslmode: disable
+# Or supply a full DSN to override the fields above:
+# postgres_dsn: "host=localhost port=5432 user=root password=secret dbname=zpc sslmode=disable"
 

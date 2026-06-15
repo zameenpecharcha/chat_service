@@ -2,28 +2,192 @@ syntax = "proto3";
 
 package chat.v1;
 
-option go_package = "chat-service/internal/pb;pb";
+option go_package = "chat-service/app/pb;pb";
+
+// ── Enums ─────────────────────────────────────────────────────────────────────
+
+enum MessageType {
+  MESSAGE_TYPE_TEXT  = 0;
+  MESSAGE_TYPE_IMAGE = 1;
+  MESSAGE_TYPE_VIDEO = 2;
+  MESSAGE_TYPE_AUDIO = 3;
+  MESSAGE_TYPE_FILE  = 4;
+}
+
+enum RoomType {
+  ROOM_TYPE_DM    = 0;
+  ROOM_TYPE_GROUP = 1;
+}
+
+// EventType differentiates data messages from control events inside the stream.
+// Control events are never stored in Cassandra.
+enum EventType {
+  EVENT_TYPE_MESSAGE      = 0;  // normal chat message (default)
+  EVENT_TYPE_TYPING_START = 1;  // user started typing
+  EVENT_TYPE_TYPING_STOP  = 2;  // user stopped typing
+  EVENT_TYPE_READ_RECEIPT = 3;  // user has read up to message_id
+  EVENT_TYPE_REACTION     = 4;  // emoji reaction on a message
+  EVENT_TYPE_DELETE       = 5;  // soft-delete a message
+  EVENT_TYPE_PRESENCE     = 6;  // online / last-seen update
+}
+
+// MessageStatus tracks the delivery lifecycle of a sent message.
+enum MessageStatus {
+  MESSAGE_STATUS_SENDING   = 0;  // client optimistic state
+  MESSAGE_STATUS_SENT      = 1;  // server acknowledged
+  MESSAGE_STATUS_DELIVERED = 2;  // at least one recipient device received it
+  MESSAGE_STATUS_READ      = 3;  // all recipients have opened it
+}
+
+// ── Chat stream ───────────────────────────────────────────────────────────────
 
 message ClientMessage {
-  string room_id = 1;
-  string user_id = 2;
-  string message_id = 3; // uuid
-  string text = 4;
-  int64 sent_at_unix_ms = 5;
+  string      room_id            = 1;
+  string      user_id            = 2;
+  string      message_id         = 3;   // client-generated UUID
+  string      text               = 4;
+  int64       sent_at_unix_ms    = 5;
+  MessageType type               = 6;
+  string      media_key          = 7;
+  string      media_name         = 8;
+  int64       media_size_bytes   = 9;
+  string      media_mime_type    = 10;
+
+  // Control events (set event_type to non-zero to send a control event)
+  EventType   event_type         = 11;
+
+  // Reply thread — set to parent message_id to create a threaded reply
+  string      reply_to_message_id = 12;
+
+  // For EVENT_TYPE_REACTION: the emoji to add/remove
+  string      reaction_emoji     = 13;
 }
 
 message ServerMessage {
-  string room_id = 1;
-  string user_id = 2;
-  string message_id = 3;
-  string text = 4;
-  int64 sent_at_unix_ms = 5;
-  int64 delivered_at_unix_ms = 6;
+  string      room_id                = 1;
+  string      user_id                = 2;
+  string      message_id             = 3;
+  string      text                   = 4;
+  int64       sent_at_unix_ms        = 5;
+  int64       delivered_at_unix_ms   = 6;
+  MessageType type                   = 7;
+  string      media_key              = 8;
+  string      media_name             = 9;
+  int64       media_size_bytes       = 10;
+  string      media_mime_type        = 11;
+  string      media_url              = 12;  // presigned GET URL (short-lived)
+
+  // Control events
+  EventType      event_type          = 13;
+
+  // Reply thread
+  string         reply_to_message_id = 14;
+
+  // Reaction
+  string         reaction_emoji      = 15;
+
+  // Edit / delete
+  bool           is_deleted          = 16;
+  int64          edited_at_unix_ms   = 17;  // 0 = never edited
+
+  // Delivery status (set by server, reflects aggregate across recipients)
+  MessageStatus  status              = 18;
+
+  // Presence (used with EVENT_TYPE_PRESENCE)
+  bool           is_online           = 19;
+  int64          last_seen_unix_ms   = 20;
 }
+
+// ── Message history ───────────────────────────────────────────────────────────
+
+message GetMessagesRequest {
+  string room_id         = 1;
+  string user_id         = 2;   // requesting user (for auth / read-receipt update)
+  int32  limit           = 3;   // max messages to return (default 50, max 200)
+  // Pagination: return messages older than this timestamp
+  int64  before_unix_ms  = 4;   // 0 = from now
+}
+
+message GetMessagesResponse {
+  repeated ServerMessage messages  = 1;
+  bool                   has_more  = 2;   // true if older messages exist
+}
+
+// ── Upload flow ───────────────────────────────────────────────────────────────
+
+message UploadRequest {
+  string user_id          = 1;
+  string room_id          = 2;
+  string file_name        = 3;
+  string mime_type        = 4;
+  int64  file_size_bytes  = 5;
+}
+
+message UploadResponse {
+  string media_key          = 1;
+  string upload_url         = 2;
+  int64  expires_at_unix_ms = 3;
+}
+
+message GetDownloadUrlRequest {
+  string user_id   = 1;
+  string media_key = 2;
+}
+
+message GetDownloadUrlResponse {
+  string url                = 1;
+  int64  expires_at_unix_ms = 2;
+}
+
+// ── Room management ───────────────────────────────────────────────────────────
+
+message CreateRoomRequest {
+  string          created_by = 1;
+  string          name       = 2;
+  RoomType        type       = 3;
+  repeated string member_ids = 4;
+}
+
+message CreateRoomResponse {
+  string room_id = 1;
+  string name    = 2;
+}
+
+// ── Presence ─────────────────────────────────────────────────────────────────
+
+message GetPresenceRequest {
+  repeated string user_ids = 1;  // batch lookup
+}
+
+message PresenceInfo {
+  string user_id         = 1;
+  bool   is_online       = 2;
+  int64  last_seen_unix_ms = 3;
+}
+
+message GetPresenceResponse {
+  repeated PresenceInfo users = 1;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
 
 service ChatService {
-  // Bidirectional streaming for live chat
+  // Bidirectional streaming for live chat, typing indicators, read receipts
   rpc Chat(stream ClientMessage) returns (stream ServerMessage);
-}
 
+  // Create a DM or group room; DMs are idempotent for the same pair
+  rpc CreateRoom(CreateRoomRequest) returns (CreateRoomResponse);
+
+  // Load paginated message history for a room
+  rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
+
+  // Get a presigned HTTP PUT URL to upload a file before sharing in chat
+  rpc RequestUpload(UploadRequest) returns (UploadResponse);
+
+  // Get a fresh presigned HTTP GET URL to download a media object
+  rpc GetDownloadUrl(GetDownloadUrlRequest) returns (GetDownloadUrlResponse);
+
+  // Batch presence lookup (online status + last seen)
+  rpc GetPresence(GetPresenceRequest) returns (GetPresenceResponse);
+}
 

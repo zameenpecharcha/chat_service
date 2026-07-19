@@ -103,21 +103,22 @@ func main() {
 		log.Warn().Msg("no object storage configured — media uploads disabled")
 	}
 
-	// ── MongoDB (message history) ─────────────────────────────────────────────
-	// Free tier: MongoDB Atlas M0 — mongodb+srv://user:pass@cluster.mongodb.net
-	// Local dev:  mongodb://localhost:27017
-	// Leave MONGO_URI empty to run without message history (in-memory only).
-	var msgRepo *repository.MessageRepository
+	// ── Message history (MongoDB if available, otherwise in-memory fallback) ─
+	var msgRepo repository.MessageStore
+	var fallbackMsgStore repository.MessageStore
 	if cfg.MongoURI != "" {
 		mr, err := repository.NewMessageRepository(cfg.MongoURI, cfg.MongoDB)
 		if err != nil {
-			log.Warn().Err(err).Msg("MongoDB unavailable — message history disabled")
+			log.Warn().Err(err).Msg("MongoDB unavailable — falling back to in-memory history")
 		} else {
 			msgRepo = mr
 			log.Info().Str("db", cfg.MongoDB).Msg("MongoDB ready")
 		}
-	} else {
-		log.Warn().Msg("MONGO_URI not set — message history disabled (in-memory only)")
+	}
+	if msgRepo == nil {
+		fallbackMsgStore = repository.NewInMemoryMessageStore()
+		msgRepo = fallbackMsgStore
+		log.Warn().Msg("message history using in-memory fallback")
 	}
 
 	// ── PostgreSQL (rooms, members, activity) ─────────────────────────────────
@@ -198,6 +199,7 @@ func main() {
 	h := chat.NewHubWithLimit(b, int64(cfg.MaxConnsPerPod))
 	s := grpc.NewServer(grpcOpts...)
 	pb.RegisterChatServiceServer(s, server.NewChatServer(h, rs, pgRepo, msgRepo, st, ps))
+	_ = fallbackMsgStore
 
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(s, hs)

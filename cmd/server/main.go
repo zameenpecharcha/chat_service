@@ -115,11 +115,6 @@ func main() {
 			log.Info().Str("db", cfg.MongoDB).Msg("MongoDB ready")
 		}
 	}
-	if msgRepo == nil {
-		fallbackMsgStore = repository.NewInMemoryMessageStore()
-		msgRepo = fallbackMsgStore
-		log.Warn().Msg("message history using in-memory fallback")
-	}
 
 	// ── PostgreSQL (rooms, members, activity) ─────────────────────────────────
 	var pgRepo *repository.RoomRepository

@@ -406,7 +406,41 @@ func (s *ChatServer) GetDownloadUrl(ctx context.Context, req *pb.GetDownloadUrlR
 	}, nil
 }
 
+// ── GetUserRooms ──────────────────────────────────────────────────────────────
+
+func (s *ChatServer) GetUserRooms(ctx context.Context, req *pb.GetUserRoomsRequest) (*pb.GetUserRoomsResponse, error) {
+	userID := req.GetUserId()
+	if userID == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id is required")
+	}
+	if s.pgRooms == nil {
+		return &pb.GetUserRoomsResponse{}, nil
+	}
+	rooms, err := s.pgRooms.GetUserRoomsDetailed(ctx, userID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get user rooms: %v", err)
+	}
+	pbRooms := make([]*pb.UserRoom, 0, len(rooms))
+	for _, r := range rooms {
+		rt := pb.RoomType_ROOM_TYPE_DM
+		if r.RoomType == 1 {
+			rt = pb.RoomType_ROOM_TYPE_GROUP
+		}
+		pbRooms = append(pbRooms, &pb.UserRoom{
+			RoomId:         r.RoomID,
+			RoomType:       rt,
+			Name:           r.Name,
+			LastMessage:    r.LastMessage,
+			LastMessageAt:  r.LastMessageAt,
+			HasUnread:      r.HasUnread,
+			MemberIds:      r.MemberIDs,
+		})
+	}
+	return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
 
 func normalizeRoomID(roomID string) string {
 	roomID = strings.TrimSpace(roomID)

@@ -25,6 +25,7 @@ const (
 	ChatService_RequestUpload_FullMethodName  = "/chat.v1.ChatService/RequestUpload"
 	ChatService_GetDownloadUrl_FullMethodName = "/chat.v1.ChatService/GetDownloadUrl"
 	ChatService_GetPresence_FullMethodName    = "/chat.v1.ChatService/GetPresence"
+	ChatService_GetUserRooms_FullMethodName   = "/chat.v1.ChatService/GetUserRooms"
 )
 
 // ChatServiceClient is the client API for ChatService service.
@@ -43,6 +44,8 @@ type ChatServiceClient interface {
 	GetDownloadUrl(ctx context.Context, in *GetDownloadUrlRequest, opts ...grpc.CallOption) (*GetDownloadUrlResponse, error)
 	// Batch presence lookup (online status + last seen)
 	GetPresence(ctx context.Context, in *GetPresenceRequest, opts ...grpc.CallOption) (*GetPresenceResponse, error)
+	// Get all active rooms for a user with last-message metadata
+	GetUserRooms(ctx context.Context, in *GetUserRoomsRequest, opts ...grpc.CallOption) (*GetUserRoomsResponse, error)
 }
 
 type chatServiceClient struct {
@@ -116,6 +119,16 @@ func (c *chatServiceClient) GetPresence(ctx context.Context, in *GetPresenceRequ
 	return out, nil
 }
 
+func (c *chatServiceClient) GetUserRooms(ctx context.Context, in *GetUserRoomsRequest, opts ...grpc.CallOption) (*GetUserRoomsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUserRoomsResponse)
+	err := c.cc.Invoke(ctx, ChatService_GetUserRooms_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ChatServiceServer is the server API for ChatService service.
 // All implementations must embed UnimplementedChatServiceServer
 // for forward compatibility.
@@ -132,6 +145,8 @@ type ChatServiceServer interface {
 	GetDownloadUrl(context.Context, *GetDownloadUrlRequest) (*GetDownloadUrlResponse, error)
 	// Batch presence lookup (online status + last seen)
 	GetPresence(context.Context, *GetPresenceRequest) (*GetPresenceResponse, error)
+	// Get all active rooms for a user with last-message metadata
+	GetUserRooms(context.Context, *GetUserRoomsRequest) (*GetUserRoomsResponse, error)
 	mustEmbedUnimplementedChatServiceServer()
 }
 
@@ -159,6 +174,9 @@ func (UnimplementedChatServiceServer) GetDownloadUrl(context.Context, *GetDownlo
 }
 func (UnimplementedChatServiceServer) GetPresence(context.Context, *GetPresenceRequest) (*GetPresenceResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetPresence not implemented")
+}
+func (UnimplementedChatServiceServer) GetUserRooms(context.Context, *GetUserRoomsRequest) (*GetUserRoomsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUserRooms not implemented")
 }
 func (UnimplementedChatServiceServer) mustEmbedUnimplementedChatServiceServer() {}
 func (UnimplementedChatServiceServer) testEmbeddedByValue()                     {}
@@ -278,6 +296,24 @@ func _ChatService_GetPresence_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChatService_GetUserRooms_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUserRoomsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ChatServiceServer).GetUserRooms(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ChatService_GetUserRooms_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ChatServiceServer).GetUserRooms(ctx, req.(*GetUserRoomsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ChatService_ServiceDesc is the grpc.ServiceDesc for ChatService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -304,6 +340,10 @@ var ChatService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetPresence",
 			Handler:    _ChatService_GetPresence_Handler,
+		},
+		{
+			MethodName: "GetUserRooms",
+			Handler:    _ChatService_GetUserRooms_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -266,8 +266,118 @@ func (r *RoomRepository) GetUserRooms(ctx context.Context, userID string) ([]str
 	return roomIDs, rows.Err()
 }
 
+// UserRoom is a room combined with last-message preview and unread flag.
+type UserRoom struct {
+	RoomID        string
+	RoomType      int    // 0=DM 1=GROUP
+	Name          string // empty for DMs
+	LastMessage   string
+	LastMessageAt int64  // Unix ms (0 if no messages yet)
+	HasUnread     bool
+	MemberIDs     []string
+}
+
+// GetUserRoomsDetailed returns all active rooms for a user with last-message
+// metadata and a per-room unread flag, sorted by most-recent activity first.
+func (r *RoomRepository) GetUserRoomsDetailed(ctx context.Context, userID string) ([]UserRoom, error) {
+	// Step 1: fetch all active rooms for this user including room metadata.
+	roomRows, err := r.db.QueryContext(ctx, `
+		SELECT cr.id, cr.room_type, COALESCE(cr.name, '')
+		FROM   chat_rooms         cr
+		JOIN   chat_room_members  m  ON m.room_id = cr.id
+		WHERE  m.user_id = $1 AND m.left_at IS NULL`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("GetUserRoomsDetailed rooms: %w", err)
+	}
+	defer roomRows.Close()
+
+	type roomBase struct {
+		id       string
+		roomType int
+		name     string
+	}
+	var bases []roomBase
+	for roomRows.Next() {
+		var b roomBase
+		if err := roomRows.Scan(&b.id, &b.roomType, &b.name); err != nil {
+			return nil, err
+		}
+		bases = append(bases, b)
+	}
+	if err := roomRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(bases) == 0 {
+		return nil, nil
+	}
+
+	// Step 2: for each room, collect members, last activity and unread status.
+	result := make([]UserRoom, 0, len(bases))
+	for _, b := range bases {
+		// Members
+		mRows, err := r.db.QueryContext(ctx, `
+			SELECT user_id FROM chat_room_members
+			WHERE  room_id = $1 AND left_at IS NULL`, b.id)
+		if err != nil {
+			return nil, fmt.Errorf("GetUserRoomsDetailed members: %w", err)
+		}
+		var memberIDs []string
+		for mRows.Next() {
+			var uid string
+			if err := mRows.Scan(&uid); err != nil {
+				mRows.Close()
+				return nil, err
+			}
+			memberIDs = append(memberIDs, uid)
+		}
+		mRows.Close()
+
+		// Last activity
+		var lastMsg string
+		var lastAt int64
+		laRow := r.db.QueryRowContext(ctx, `
+			SELECT COALESCE(preview_text,''), COALESCE(EXTRACT(EPOCH FROM last_message_at)*1000,0)::BIGINT
+			FROM   chat_room_last_activity
+			WHERE  room_id = $1`, b.id)
+		_ = laRow.Scan(&lastMsg, &lastAt)
+
+		// Unread flag: user has a read receipt and last_message_at > last_read_at
+		var hasUnread bool
+		rrRow := r.db.QueryRowContext(ctx, `
+			SELECT CASE
+			  WHEN la.last_message_at IS NULL THEN false
+			  WHEN rr.last_read_at   IS NULL THEN true
+			  WHEN la.last_message_at > rr.last_read_at THEN true
+			  ELSE false
+			END
+			FROM  chat_room_last_activity la
+			LEFT  JOIN chat_read_receipts rr
+				  ON rr.room_id = la.room_id AND rr.user_id = $2
+			WHERE la.room_id = $1`, b.id, userID)
+		_ = rrRow.Scan(&hasUnread)
+
+		result = append(result, UserRoom{
+			RoomID:        b.id,
+			RoomType:      b.roomType,
+			Name:          b.name,
+			LastMessage:   lastMsg,
+			LastMessageAt: lastAt,
+			HasUnread:     hasUnread,
+			MemberIDs:     memberIDs,
+		})
+	}
+
+	// Sort by last activity descending (most recent first).
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].LastMessageAt > result[j].LastMessageAt
+	})
+
+	return result, nil
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: s != ""}
 }
+

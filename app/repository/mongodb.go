@@ -55,6 +55,16 @@ type mediaUploadDoc struct {
 // MessageRepository — MongoDB-backed
 // ─────────────────────────────────────────────────────────────────────────────
 
+// MessageStore is the persistence contract used by the chat server.
+type MessageStore interface {
+	SaveMessage(ctx context.Context, msg *pb.ServerMessage) error
+	SoftDeleteMessage(ctx context.Context, roomID string, sentAtUnixMs int64, messageID string) error
+	SaveMediaUpload(ctx context.Context, mediaKey, uploaderID, roomID, fileName, mimeType string, sizeBytes int64, expiresAt time.Time) error
+	UpdateReadReceipt(ctx context.Context, roomID, userID, lastMsgID string, lastReadAt time.Time) error
+	GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error)
+	Close()
+}
+
 // MessageRepository persists and retrieves chat messages from MongoDB.
 // Compatible with MongoDB Atlas M0 (free tier) and any self-hosted instance.
 type MessageRepository struct {

@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,7 +26,7 @@ type ChatServer struct {
 	hub      *chat.Hub
 	rooms    *chat.RoomStore
 	pgRooms  *repository.RoomRepository
-	msgRepo  *repository.MessageRepository
+	msgRepo  repository.MessageStore
 	storage  storage.Storage
 	presence chat.PresenceStore
 }
@@ -33,7 +35,7 @@ func NewChatServer(
 	h *chat.Hub,
 	rs *chat.RoomStore,
 	pg *repository.RoomRepository,
-	msg *repository.MessageRepository,
+	msg repository.MessageStore,
 	st storage.Storage,
 	ps chat.PresenceStore,
 ) *ChatServer {
@@ -64,7 +66,8 @@ func (s *ChatServer) Chat(stream pb.ChatService_ChatServer) error {
 	}
 
 	userID := first.GetUserId()
-	roomID := first.GetRoomId()
+	roomID := normalizeRoomID(first.GetRoomId())
+	log.Printf("[chat-service] stream connected user=%s room=%s", userID, roomID)
 
 	client := chat.NewClient(userID, roomID)
 	ctx := stream.Context()
@@ -136,31 +139,34 @@ func (s *ChatServer) Chat(stream pb.ChatService_ChatServer) error {
 
 // processIncoming routes a ClientMessage to the correct handler based on EventType.
 func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) {
+	roomID := normalizeRoomID(in.GetRoomId())
+
 	switch in.GetEventType() {
 
 	case pb.EventType_EVENT_TYPE_TYPING_START, pb.EventType_EVENT_TYPE_TYPING_STOP:
 		// Typing indicator: broadcast control event, never persist
 		s.hub.Broadcast(ctx, &pb.ServerMessage{
-			RoomId:    in.GetRoomId(),
+			RoomId:    roomID,
 			UserId:    in.GetUserId(),
 			EventType: in.GetEventType(),
 		}, false)
 
 	case pb.EventType_EVENT_TYPE_READ_RECEIPT:
+		log.Printf("[chat-service] read receipt room=%s user=%s message=%s", roomID, in.GetUserId(), in.GetMessageId())
 		// Read receipt: update Cassandra + Postgres, broadcast ✓✓ to room
 		if in.GetMessageId() != "" {
 			now := time.Now()
 			go func() {
 				bg := context.Background()
 				if s.msgRepo != nil {
-					_ = s.msgRepo.UpdateReadReceipt(bg, in.GetRoomId(), in.GetUserId(), in.GetMessageId(), now)
+					_ = s.msgRepo.UpdateReadReceipt(bg, roomID, in.GetUserId(), in.GetMessageId(), now)
 				}
 				if s.pgRooms != nil {
-					_ = s.pgRooms.UpdateReadReceipt(bg, in.GetRoomId(), in.GetUserId(), in.GetMessageId(), now)
+					_ = s.pgRooms.UpdateReadReceipt(bg, roomID, in.GetUserId(), in.GetMessageId(), now)
 				}
 			}()
 			s.hub.Broadcast(ctx, &pb.ServerMessage{
-				RoomId:    in.GetRoomId(),
+				RoomId:    roomID,
 				UserId:    in.GetUserId(),
 				MessageId: in.GetMessageId(),
 				EventType: pb.EventType_EVENT_TYPE_READ_RECEIPT,
@@ -172,7 +178,7 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 		// Emoji reaction: broadcast to room (persist to Cassandra in future iteration)
 		if in.GetMessageId() != "" && in.GetReactionEmoji() != "" {
 			s.hub.Broadcast(ctx, &pb.ServerMessage{
-				RoomId:        in.GetRoomId(),
+				RoomId:        roomID,
 				UserId:        in.GetUserId(),
 				MessageId:     in.GetMessageId(),
 				EventType:     pb.EventType_EVENT_TYPE_REACTION,
@@ -186,11 +192,11 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 			if s.msgRepo != nil {
 				go func() {
 					_ = s.msgRepo.SoftDeleteMessage(context.Background(),
-						in.GetRoomId(), in.GetSentAtUnixMs(), in.GetMessageId())
+						roomID, in.GetSentAtUnixMs(), in.GetMessageId())
 				}()
 			}
 			s.hub.Broadcast(ctx, &pb.ServerMessage{
-				RoomId:    in.GetRoomId(),
+				RoomId:    roomID,
 				UserId:    in.GetUserId(),
 				MessageId: in.GetMessageId(),
 				EventType: pb.EventType_EVENT_TYPE_DELETE,
@@ -199,6 +205,7 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 		}
 
 	default:
+		log.Printf("[chat-service] incoming message room=%s user=%s event=%v text=%q media=%s", roomID, in.GetUserId(), in.GetEventType(), in.GetText(), in.GetMediaKey())
 		// EVENT_TYPE_MESSAGE (0) or any unknown value — treat as a chat message
 		if in.GetText() == "" && in.GetMediaKey() == "" {
 			return // empty frame (e.g. the register-only first message)
@@ -238,7 +245,9 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 // ── GetMessages ───────────────────────────────────────────────────────────────
 
 func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	if req.GetRoomId() == "" {
+	roomID := normalizeRoomID(req.GetRoomId())
+	log.Printf("[chat-service] get messages room=%s user=%s limit=%d before=%d", roomID, req.GetUserId(), req.GetLimit(), req.GetBeforeUnixMs())
+	if roomID == "" {
 		return nil, status.Error(codes.InvalidArgument, "room_id is required")
 	}
 	if s.msgRepo == nil {
@@ -250,7 +259,7 @@ func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest
 		limit = 50
 	}
 
-	msgs, err := s.msgRepo.GetMessagesBefore(ctx, req.GetRoomId(), req.GetBeforeUnixMs(), limit+1)
+	msgs, err := s.msgRepo.GetMessagesBefore(ctx, roomID, req.GetBeforeUnixMs(), limit+1)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "get messages: %v", err)
 	}
@@ -267,10 +276,10 @@ func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest
 			bg := context.Background()
 			now := time.Now()
 			if s.msgRepo != nil {
-				_ = s.msgRepo.UpdateReadReceipt(bg, req.GetRoomId(), req.GetUserId(), newest.GetMessageId(), now)
+				_ = s.msgRepo.UpdateReadReceipt(bg, roomID, req.GetUserId(), newest.GetMessageId(), now)
 			}
 			if s.pgRooms != nil {
-				_ = s.pgRooms.UpdateReadReceipt(bg, req.GetRoomId(), req.GetUserId(), newest.GetMessageId(), now)
+				_ = s.pgRooms.UpdateReadReceipt(bg, roomID, req.GetUserId(), newest.GetMessageId(), now)
 			}
 		}()
 	}
@@ -290,6 +299,7 @@ func (s *ChatServer) GetPresence(ctx context.Context, req *pb.GetPresenceRequest
 // ── CreateRoom ────────────────────────────────────────────────────────────────
 
 func (s *ChatServer) CreateRoom(ctx context.Context, req *pb.CreateRoomRequest) (*pb.CreateRoomResponse, error) {
+	log.Printf("[chat-service] create room type=%v createdBy=%s members=%v name=%q", req.GetType(), req.GetCreatedBy(), req.GetMemberIds(), req.GetName())
 	if req.GetCreatedBy() == "" {
 		return nil, status.Error(codes.InvalidArgument, "created_by is required")
 	}
@@ -398,9 +408,40 @@ func (s *ChatServer) GetDownloadUrl(ctx context.Context, req *pb.GetDownloadUrlR
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+func normalizeRoomID(roomID string) string {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return roomID
+	}
+	if strings.HasPrefix(roomID, "dm-") {
+		parts := strings.Split(roomID, "-")
+		if len(parts) >= 3 && parts[1] != "" && parts[2] != "" {
+			userA := parts[1]
+			userB := strings.Join(parts[2:], "-")
+			if userA != "" && userB != "" {
+				ids := []string{userA, userB}
+				sort.Strings(ids)
+				return fmt.Sprintf("dm:%s:%s", ids[0], ids[1])
+			}
+		}
+	}
+	if strings.HasPrefix(roomID, "dm:") {
+		parts := strings.Split(roomID, ":")
+		if len(parts) >= 3 && parts[1] != "" && parts[2] != "" {
+			ids := []string{parts[1], parts[2]}
+			if ids[0] != "" && ids[1] != "" {
+				sort.Strings(ids)
+				return fmt.Sprintf("dm:%s:%s", ids[0], ids[1])
+			}
+		}
+	}
+	return roomID
+}
+
 func toServerMsg(m *pb.ClientMessage) *pb.ServerMessage {
+	roomID := normalizeRoomID(m.GetRoomId())
 	return &pb.ServerMessage{
-		RoomId:            m.GetRoomId(),
+		RoomId:            roomID,
 		UserId:            m.GetUserId(),
 		MessageId:         m.GetMessageId(),
 		Text:              m.GetText(),

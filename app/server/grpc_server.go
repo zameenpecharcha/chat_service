@@ -66,8 +66,10 @@ func (s *ChatServer) Chat(stream pb.ChatService_ChatServer) error {
 	}
 
 	userID := first.GetUserId()
+	// Bug-1/2/3 fix: normalize the roomId from the first frame so the hub
+	// registers and broadcasts under the canonical "dm:low:high" key.
 	roomID := normalizeRoomID(first.GetRoomId())
-	log.Printf("[chat-service] stream connected user=%s room=%s", userID, roomID)
+	log.Printf("[chat-service] stream connected user=%s room=%s (raw=%s)", userID, roomID, first.GetRoomId())
 
 	client := chat.NewClient(userID, roomID)
 	ctx := stream.Context()
@@ -139,6 +141,8 @@ func (s *ChatServer) Chat(stream pb.ChatService_ChatServer) error {
 
 // processIncoming routes a ClientMessage to the correct handler based on EventType.
 func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) {
+	// Bug-2/3 fix: always normalize the roomId before routing or persisting so
+	// all messages land under the canonical DM key regardless of what the client sent.
 	roomID := normalizeRoomID(in.GetRoomId())
 
 	switch in.GetEventType() {
@@ -211,7 +215,7 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 			return // empty frame (e.g. the register-only first message)
 		}
 		sm := toServerMsg(in)
-		sm.Status = pb.MessageStatus_MESSAGE_STATUS_DELIVERED
+		sm.Status = pb.MessageStatus_MESSAGE_STATUS_SENT
 		s.hub.Broadcast(ctx, sm, true)
 		s.persistMessage(ctx, sm)
 	}
@@ -235,9 +239,12 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 			if len(preview) > 120 {
 				preview = preview[:120]
 			}
-			_ = s.pgRooms.UpdateLastActivity(bg,
+			// Bug-3 fix: log the error so FK failures are visible instead of silent.
+			if err := s.pgRooms.UpdateLastActivity(bg,
 				msg.GetRoomId(), msg.GetMessageId(), msg.GetUserId(),
-				preview, time.UnixMilli(msg.GetSentAtUnixMs()).UTC())
+				preview, time.UnixMilli(msg.GetSentAtUnixMs()).UTC()); err != nil {
+				log.Printf("[chat-service] UpdateLastActivity room=%s err=%v", msg.GetRoomId(), err)
+			}
 		}
 	}()
 }
@@ -245,7 +252,7 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 // ── GetMessages ───────────────────────────────────────────────────────────────
 
 func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	roomID := normalizeRoomID(req.GetRoomId())
+	roomID := req.GetRoomId()
 	log.Printf("[chat-service] get messages room=%s user=%s limit=%d before=%d", roomID, req.GetUserId(), req.GetLimit(), req.GetBeforeUnixMs())
 	if roomID == "" {
 		return nil, status.Error(codes.InvalidArgument, "room_id is required")
@@ -413,29 +420,62 @@ func (s *ChatServer) GetUserRooms(ctx context.Context, req *pb.GetUserRoomsReque
 	if userID == "" {
 		return nil, status.Error(codes.InvalidArgument, "user_id is required")
 	}
-	if s.pgRooms == nil {
+
+	// Try Postgres first (has richer metadata: unread flag, group name, etc.)
+	if s.pgRooms != nil {
+		rooms, err := s.pgRooms.GetUserRoomsDetailed(ctx, userID)
+		if err != nil {
+			log.Printf("[chat-service] GetUserRooms pg error user=%s: %v", userID, err)
+		} else if len(rooms) > 0 {
+			pbRooms := make([]*pb.UserRoom, 0, len(rooms))
+			for _, r := range rooms {
+				rt := pb.RoomType_ROOM_TYPE_DM
+				if r.RoomType == 1 {
+					rt = pb.RoomType_ROOM_TYPE_GROUP
+				}
+				pbRooms = append(pbRooms, &pb.UserRoom{
+					RoomId:        r.RoomID,
+					RoomType:      rt,
+					Name:          r.Name,
+					LastMessage:   r.LastMessage,
+					LastMessageAt: r.LastMessageAt,
+					HasUnread:     r.HasUnread,
+					MemberIds:     r.MemberIDs,
+				})
+			}
+			return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
+		}
+	}
+
+	// Fallback: query MongoDB messages directly for rooms this user participated in.
+	// This covers the case where pgRooms is nil or Postgres tables are empty.
+	if s.msgRepo == nil {
 		return &pb.GetUserRoomsResponse{}, nil
 	}
-	rooms, err := s.pgRooms.GetUserRoomsDetailed(ctx, userID)
+
+	summaries, err := s.msgRepo.GetUserRooms(ctx, userID)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get user rooms: %v", err)
+		log.Printf("[chat-service] GetUserRooms mongo error user=%s: %v", userID, err)
+		return &pb.GetUserRoomsResponse{}, nil
 	}
-	pbRooms := make([]*pb.UserRoom, 0, len(rooms))
-	for _, r := range rooms {
+
+	pbRooms := make([]*pb.UserRoom, 0, len(summaries))
+	for _, r := range summaries {
 		rt := pb.RoomType_ROOM_TYPE_DM
-		if r.RoomType == 1 {
+		if len(r.RoomID) > 6 && r.RoomID[:6] == "group:" {
 			rt = pb.RoomType_ROOM_TYPE_GROUP
 		}
 		pbRooms = append(pbRooms, &pb.UserRoom{
-			RoomId:         r.RoomID,
-			RoomType:       rt,
-			Name:           r.Name,
-			LastMessage:    r.LastMessage,
-			LastMessageAt:  r.LastMessageAt,
-			HasUnread:      r.HasUnread,
-			MemberIds:      r.MemberIDs,
+			RoomId:        r.RoomID,
+			RoomType:      rt,
+			Name:          "",
+			LastMessage:   r.LastMessage,
+			LastMessageAt: r.LastMessageAt.UnixMilli(),
+			HasUnread:     false,
+			MemberIds:     r.MemberIDs,
 		})
 	}
+	log.Printf("[chat-service] GetUserRooms mongo fallback user=%s rooms=%d", userID, len(pbRooms))
 	return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
 }
 
@@ -473,6 +513,8 @@ func normalizeRoomID(roomID string) string {
 }
 
 func toServerMsg(m *pb.ClientMessage) *pb.ServerMessage {
+	// Bug-2 fix: normalize the roomId before building the ServerMessage so that
+	// both the hub broadcast and the MongoDB save use the canonical key.
 	roomID := normalizeRoomID(m.GetRoomId())
 	return &pb.ServerMessage{
 		RoomId:            roomID,

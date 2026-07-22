@@ -55,6 +55,14 @@ type mediaUploadDoc struct {
 // MessageRepository — MongoDB-backed
 // ─────────────────────────────────────────────────────────────────────────────
 
+// UserRoomSummary contains the minimal room data needed for the inbox sidebar.
+type UserRoomSummary struct {
+	RoomID        string
+	LastMessage   string
+	LastMessageAt time.Time
+	MemberIDs     []string // extracted from dm:a:b room_id for DMs
+}
+
 // MessageStore is the persistence contract used by the chat server.
 type MessageStore interface {
 	SaveMessage(ctx context.Context, msg *pb.ServerMessage) error
@@ -62,6 +70,7 @@ type MessageStore interface {
 	SaveMediaUpload(ctx context.Context, mediaKey, uploaderID, roomID, fileName, mimeType string, sizeBytes int64, expiresAt time.Time) error
 	UpdateReadReceipt(ctx context.Context, roomID, userID, lastMsgID string, lastReadAt time.Time) error
 	GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error)
+	GetUserRooms(ctx context.Context, userID string) ([]UserRoomSummary, error)
 	Close()
 }
 
@@ -258,13 +267,13 @@ func (r *MessageRepository) GetMessages(ctx context.Context, roomID string, limi
 }
 
 // GetMessagesBefore returns up to `limit` messages sent strictly before
-// beforeUnixMs, newest first. Pass 0 to fetch from now.
+// beforeUnixMs, newest first. Pass 0 to fetch the latest messages.
 func (r *MessageRepository) GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	if beforeUnixMs == 0 {
-		beforeUnixMs = time.Now().UnixMilli()
+		return r.GetMessages(ctx, roomID, limit, 0)
 	}
 	return r.queryMessages(ctx,
 		bson.M{
@@ -312,4 +321,104 @@ func (r *MessageRepository) queryMessages(ctx context.Context, filter bson.M, li
 		})
 	}
 	return results, cur.Err()
+}
+
+// GetUserRooms finds all rooms a user has participated in by scanning MongoDB messages.
+// For DMs the room_id is "dm:a:b" (sorted), so any room_id containing the userID
+// as a DM segment belongs to this user. For group rooms the user must appear as sender.
+// Returns one summary per room sorted by most-recent message first.
+func (r *MessageRepository) GetUserRooms(ctx context.Context, userID string) ([]UserRoomSummary, error) {
+	// Exact DM segment regex:
+	// Supports both ":" and "-" formats (legacy data check)
+	exactDmRegex := "^dm[:-]" + userID + "[:-]|^dm[:-][^:-]+[:-]" + userID + "$"
+
+	pipeline := bson.A{
+		// Step 1: match messages for this user (as sender or DM participant)
+		bson.M{"$match": bson.M{
+			"is_deleted": bson.M{"$ne": true},
+			"$or": bson.A{
+				bson.M{"user_id": userID},
+				bson.M{"room_id": bson.M{"$regex": exactDmRegex}},
+			},
+		}},
+		// Step 2: sort by sent_at desc so $first gives us the latest message
+		bson.M{"$sort": bson.M{"sent_at": -1}},
+		// Step 3: group by room_id, pick first (latest) message
+		bson.M{"$group": bson.M{
+			"_id":          "$room_id",
+			"lastText":     bson.M{"$first": "$text_body"},
+			"lastSentAt":   bson.M{"$first": "$sent_at"},
+		}},
+		// Step 4: sort groups by most recent
+		bson.M{"$sort": bson.M{"lastSentAt": -1}},
+		// Step 5: limit to 100 rooms
+		bson.M{"$limit": 100},
+	}
+
+	cur, err := r.messages.Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("GetUserRooms aggregate: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	var results []UserRoomSummary
+	for cur.Next(ctx) {
+		var row struct {
+			RoomID    string    `bson:"_id"`
+			LastText  string    `bson:"lastText"`
+			LastSentAt time.Time `bson:"lastSentAt"`
+		}
+		if err := cur.Decode(&row); err != nil {
+			continue
+		}
+		// Extract member IDs from DM room_id (supports both dm: and dm-)
+		var memberIDs []string
+		if len(row.RoomID) > 3 && (row.RoomID[:3] == "dm:" || row.RoomID[:3] == "dm-") {
+			parts := splitRoomID(row.RoomID)
+			if len(parts) == 2 {
+				memberIDs = parts
+			}
+		}
+		results = append(results, UserRoomSummary{
+			RoomID:        row.RoomID,
+			LastMessage:   row.LastText,
+			LastMessageAt: row.LastSentAt,
+			MemberIDs:     memberIDs,
+		})
+	}
+	return results, cur.Err()
+}
+
+func splitRoomID(roomID string) []string {
+	// "dm:a:b" or "dm-a-b" → ["a", "b"]
+	if len(roomID) <= 3 {
+		return nil
+	}
+	rest := roomID[3:] // strip "dm:" or "dm-"
+	sep := -1
+	for i, c := range rest {
+		if c == ':' || c == '-' {
+			sep = i
+			break
+		}
+	}
+	if sep < 0 {
+		return nil
+	}
+	return []string{rest[:sep], rest[sep+1:]}
+}
+
+func containsStr(s, sub string) bool {
+	return len(s) >= len(sub) && func() bool {
+		for i := 0; i <= len(s)-len(sub); i++ {
+			if s[i:i+len(sub)] == sub {
+				return true
+			}
+		}
+		return false
+	}()
+}
+
+func hasSuffix(s, suffix string) bool {
+	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }

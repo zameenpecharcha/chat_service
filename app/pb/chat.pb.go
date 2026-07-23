@@ -134,6 +134,7 @@ const (
 	EventType_EVENT_TYPE_REACTION     EventType = 4 // emoji reaction on a message
 	EventType_EVENT_TYPE_DELETE       EventType = 5 // soft-delete a message
 	EventType_EVENT_TYPE_PRESENCE     EventType = 6 // online / last-seen update
+	EventType_EVENT_TYPE_EDIT         EventType = 7 // edit message text
 )
 
 // Enum value maps for EventType.
@@ -146,6 +147,7 @@ var (
 		4: "EVENT_TYPE_REACTION",
 		5: "EVENT_TYPE_DELETE",
 		6: "EVENT_TYPE_PRESENCE",
+		7: "EVENT_TYPE_EDIT",
 	}
 	EventType_value = map[string]int32{
 		"EVENT_TYPE_MESSAGE":      0,
@@ -155,6 +157,7 @@ var (
 		"EVENT_TYPE_REACTION":     4,
 		"EVENT_TYPE_DELETE":       5,
 		"EVENT_TYPE_PRESENCE":     6,
+		"EVENT_TYPE_EDIT":         7,
 	}
 )
 

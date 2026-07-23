@@ -1,11 +1,4 @@
-// chat-service entrypoint.
-//
-// Required env vars (override config/config.yaml when set):
-//   MONGO_URI, MONGO_DB          — message history (optional; in-memory fallback)
-//   POSTGRES_DSN                 — full DSN, or use POSTGRES_HOST/PORT/USER/PASSWORD/DB/SSLMODE
-//   REDIS_URL or REDIS_ADDR      — pub/sub and presence
-//   JWT_PUBLIC_KEY_PATH          — RS256 public key (same as user_service)
-package main
+
 
 import (
 	"context"

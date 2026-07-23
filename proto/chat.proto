@@ -29,6 +29,7 @@ enum EventType {
   EVENT_TYPE_REACTION     = 4;  // emoji reaction on a message
   EVENT_TYPE_DELETE       = 5;  // soft-delete a message
   EVENT_TYPE_PRESENCE     = 6;  // online / last-seen update
+  EVENT_TYPE_EDIT         = 7;  // edit message text (Teams-style)
 }
 
 // MessageStatus tracks the delivery lifecycle of a sent message.

@@ -30,6 +30,7 @@ type messageDoc struct {
 	MediaSizeBytes   int64          `bson:"media_size_bytes,omitempty"`
 	ReplyToMessageID string         `bson:"reply_to_message_id,omitempty"`
 	IsDeleted        bool           `bson:"is_deleted"`
+	EditedAt         time.Time      `bson:"edited_at,omitempty"`
 	ReactionSummary  map[string]int `bson:"reaction_summary,omitempty"`
 }
 
@@ -67,6 +68,8 @@ type UserRoomSummary struct {
 type MessageStore interface {
 	SaveMessage(ctx context.Context, msg *pb.ServerMessage) error
 	SoftDeleteMessage(ctx context.Context, roomID string, sentAtUnixMs int64, messageID string) error
+	EditMessage(ctx context.Context, messageID, userID, newText string) (int64, error)
+	SoftDeleteMessageByOwner(ctx context.Context, messageID, userID string) (bool, error)
 	SaveMediaUpload(ctx context.Context, mediaKey, uploaderID, roomID, fileName, mimeType string, sizeBytes int64, expiresAt time.Time) error
 	UpdateReadReceipt(ctx context.Context, roomID, userID, lastMsgID string, lastReadAt time.Time) error
 	GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error)
@@ -217,6 +220,41 @@ func (r *MessageRepository) SoftDeleteMessage(ctx context.Context, _ string, sen
 	return err
 }
 
+// SoftDeleteMessageByOwner soft-deletes only if message_id belongs to userID.
+func (r *MessageRepository) SoftDeleteMessageByOwner(ctx context.Context, messageID, userID string) (bool, error) {
+	res, err := r.messages.UpdateOne(ctx,
+		bson.M{"message_id": messageID, "user_id": userID},
+		bson.M{"$set": bson.M{"is_deleted": true}},
+	)
+	if err != nil {
+		return false, err
+	}
+	return res.ModifiedCount > 0 || res.MatchedCount > 0, nil
+}
+
+// EditMessage updates text for a message owned by userID. Returns edited_at unix ms.
+func (r *MessageRepository) EditMessage(ctx context.Context, messageID, userID, newText string) (int64, error) {
+	now := time.Now().UTC()
+	res, err := r.messages.UpdateOne(ctx,
+		bson.M{
+			"message_id": messageID,
+			"user_id":    userID,
+			"is_deleted": bson.M{"$ne": true},
+		},
+		bson.M{"$set": bson.M{
+			"text_body": newText,
+			"edited_at": now,
+		}},
+	)
+	if err != nil {
+		return 0, err
+	}
+	if res.MatchedCount == 0 {
+		return 0, fmt.Errorf("message not found or not owned by user")
+	}
+	return now.UnixMilli(), nil
+}
+
 // SaveMediaUpload records a media upload in the media_uploads collection.
 func (r *MessageRepository) SaveMediaUpload(ctx context.Context,
 	mediaKey, uploaderID, roomID, fileName, mimeType string,
@@ -260,8 +298,9 @@ func (r *MessageRepository) GetMessages(ctx context.Context, roomID string, limi
 	if limit <= 0 {
 		limit = 50
 	}
+	// Include soft-deleted messages so clients can show Teams-style tombstones.
 	return r.queryMessages(ctx,
-		bson.M{"room_id": roomID, "is_deleted": bson.M{"$ne": true}},
+		bson.M{"room_id": roomID},
 		limit,
 	)
 }
@@ -277,9 +316,8 @@ func (r *MessageRepository) GetMessagesBefore(ctx context.Context, roomID string
 	}
 	return r.queryMessages(ctx,
 		bson.M{
-			"room_id":    roomID,
-			"sent_at":    bson.M{"$lt": time.UnixMilli(beforeUnixMs).UTC()},
-			"is_deleted": bson.M{"$ne": true},
+			"room_id": roomID,
+			"sent_at": bson.M{"$lt": time.UnixMilli(beforeUnixMs).UTC()},
 		},
 		limit,
 	)
@@ -317,7 +355,13 @@ func (r *MessageRepository) queryMessages(ctx context.Context, filter bson.M, li
 			MediaSizeBytes:    doc.MediaSizeBytes,
 			ReplyToMessageId:  doc.ReplyToMessageID,
 			IsDeleted:         doc.IsDeleted,
-			EventType:         pb.EventType_EVENT_TYPE_MESSAGE,
+			EditedAtUnixMs: func() int64 {
+				if doc.EditedAt.IsZero() {
+					return 0
+				}
+				return doc.EditedAt.UnixMilli()
+			}(),
+			EventType: pb.EventType_EVENT_TYPE_MESSAGE,
 		})
 	}
 	return results, cur.Err()

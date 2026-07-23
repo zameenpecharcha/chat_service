@@ -191,20 +191,54 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 		}
 
 	case pb.EventType_EVENT_TYPE_DELETE:
-		// Soft delete: mark in Cassandra, broadcast tombstone
-		if in.GetMessageId() != "" {
+		// Soft delete for everyone — author only. Never broadcast without ownership check.
+		if in.GetMessageId() == "" {
+			return
+		}
+		if s.msgRepo == nil {
+			log.Printf("[chat-service] SoftDelete rejected (no message store) room=%s user=%s msg=%s",
+				roomID, in.GetUserId(), in.GetMessageId())
+			return
+		}
+		deleted, err := s.msgRepo.SoftDeleteMessageByOwner(context.Background(),
+			in.GetMessageId(), in.GetUserId())
+		if err != nil {
+			log.Printf("[chat-service] SoftDelete err=%v", err)
+			return
+		}
+		if !deleted {
+			log.Printf("[chat-service] SoftDelete denied room=%s user=%s msg=%s",
+				roomID, in.GetUserId(), in.GetMessageId())
+			return
+		}
+		s.hub.Broadcast(ctx, &pb.ServerMessage{
+			RoomId:    roomID,
+			UserId:    in.GetUserId(),
+			MessageId: in.GetMessageId(),
+			EventType: pb.EventType_EVENT_TYPE_DELETE,
+			IsDeleted: true,
+		}, true)
+
+	case pb.EventType_EVENT_TYPE_EDIT:
+		// Edit: author updates text; persist + broadcast with edited_at
+		if in.GetMessageId() != "" && strings.TrimSpace(in.GetText()) != "" {
+			editedAt := time.Now().UnixMilli()
 			if s.msgRepo != nil {
-				go func() {
-					_ = s.msgRepo.SoftDeleteMessage(context.Background(),
-						roomID, in.GetSentAtUnixMs(), in.GetMessageId())
-				}()
+				at, err := s.msgRepo.EditMessage(context.Background(),
+					in.GetMessageId(), in.GetUserId(), strings.TrimSpace(in.GetText()))
+				if err != nil {
+					log.Printf("[chat-service] EditMessage err=%v", err)
+					return
+				}
+				editedAt = at
 			}
 			s.hub.Broadcast(ctx, &pb.ServerMessage{
-				RoomId:    roomID,
-				UserId:    in.GetUserId(),
-				MessageId: in.GetMessageId(),
-				EventType: pb.EventType_EVENT_TYPE_DELETE,
-				IsDeleted: true,
+				RoomId:         roomID,
+				UserId:         in.GetUserId(),
+				MessageId:      in.GetMessageId(),
+				Text:           strings.TrimSpace(in.GetText()),
+				EventType:      pb.EventType_EVENT_TYPE_EDIT,
+				EditedAtUnixMs: editedAt,
 			}, true)
 		}
 

@@ -245,6 +245,20 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 				preview, time.UnixMilli(msg.GetSentAtUnixMs()).UTC()); err != nil {
 				log.Printf("[chat-service] UpdateLastActivity room=%s err=%v", msg.GetRoomId(), err)
 			}
+			// Sender has already "seen" their own message — advance their read
+			// cursor so the room does not appear unread to them.
+			if msg.GetUserId() != "" {
+				at := time.UnixMilli(msg.GetSentAtUnixMs()).UTC()
+				if at.IsZero() {
+					at = time.Now().UTC()
+				}
+				if err := s.pgRooms.UpdateReadReceipt(bg, msg.GetRoomId(), msg.GetUserId(), msg.GetMessageId(), at); err != nil {
+					log.Printf("[chat-service] UpdateReadReceipt sender room=%s err=%v", msg.GetRoomId(), err)
+				}
+				if s.msgRepo != nil {
+					_ = s.msgRepo.UpdateReadReceipt(bg, msg.GetRoomId(), msg.GetUserId(), msg.GetMessageId(), at)
+				}
+			}
 		}
 	}()
 }

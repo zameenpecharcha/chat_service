@@ -341,11 +341,13 @@ func (r *RoomRepository) GetUserRoomsDetailed(ctx context.Context, userID string
 			WHERE  room_id = $1`, b.id)
 		_ = laRow.Scan(&lastMsg, &lastAt)
 
-		// Unread flag: user has a read receipt and last_message_at > last_read_at
+		// Unread flag: last activity after this user's read cursor, and the
+		// last message was NOT sent by this user (own sends must not badge).
 		var hasUnread bool
 		rrRow := r.db.QueryRowContext(ctx, `
 			SELECT CASE
 			  WHEN la.last_message_at IS NULL THEN false
+			  WHEN la.last_sender_id IS NOT NULL AND la.last_sender_id = $2 THEN false
 			  WHEN rr.last_read_at   IS NULL THEN true
 			  WHEN la.last_message_at > rr.last_read_at THEN true
 			  ELSE false

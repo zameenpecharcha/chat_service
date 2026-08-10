@@ -190,6 +190,179 @@ message GetUserRoomsResponse {
   repeated UserRoom rooms = 1;
 }
 
+// ── Extended Conversation & Group Management ──────────────────────────────────
+
+message ConversationDetail {
+  string          conversation_id = 1;
+  RoomType        type            = 2;
+  repeated string participants    = 3;
+  string          group_name      = 4;
+  string          group_photo     = 5;
+  string          description     = 6;
+  int32           member_count    = 7;
+  string          last_message    = 8;
+  string          last_message_id = 9;
+  int64           last_message_at = 10;
+  string          created_by      = 11;
+  int64           created_at      = 12;
+}
+
+message GroupMember {
+  string id              = 1;
+  string conversation_id = 2;
+  string user_id         = 3;
+  string role            = 4; // OWNER, ADMIN, MEMBER
+  int64  joined_at       = 5;
+  string status          = 6; // ACTIVE, INACTIVE
+}
+
+message GetConversationRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+}
+
+message GetConversationResponse {
+  ConversationDetail conversation  = 1;
+  repeated GroupMember members    = 2;
+}
+
+message SendMessageRequest {
+  string      conversation_id     = 1;
+  string      sender_id           = 2;
+  string      content             = 3;
+  MessageType message_type        = 4;
+  string      media_key           = 5;
+  string      media_name          = 6;
+  int64       media_size_bytes    = 7;
+  string      media_mime_type     = 8;
+  string      reply_to_message_id = 9;
+}
+
+message SendMessageResponse {
+  ServerMessage message = 1;
+}
+
+message SearchMessagesRequest {
+  string conversation_id = 1;
+  string query           = 2;
+  int32  limit           = 3;
+}
+
+message SearchMessagesResponse {
+  repeated ServerMessage messages = 1;
+}
+
+message DeleteMessageRequest {
+  string message_id      = 1;
+  string user_id         = 2;
+  string conversation_id = 3;
+}
+
+message DeleteMessageResponse {
+  bool success = 1;
+}
+
+message EditMessageRequest {
+  string message_id      = 1;
+  string user_id         = 2;
+  string conversation_id = 3;
+  string new_content     = 4;
+}
+
+message EditMessageResponse {
+  ServerMessage message = 1;
+}
+
+message MarkMessageReadRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+  string message_id      = 3;
+}
+
+message MarkMessageReadResponse {
+  bool success = 1;
+}
+
+message GetUnreadCountRequest {
+  string user_id         = 1;
+  string conversation_id = 2; // optional: empty means across all conversations
+}
+
+message GetUnreadCountResponse {
+  int32 total_unread_count = 1;
+}
+
+message CreateGroupRequest {
+  string          created_by  = 1;
+  string          group_name  = 2;
+  string          group_photo = 3;
+  string          description = 4;
+  repeated string member_ids  = 5;
+}
+
+message CreateGroupResponse {
+  ConversationDetail conversation = 1;
+}
+
+message AddGroupMemberRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+  string operator_id     = 3;
+  string role            = 4; // MEMBER, ADMIN
+}
+
+message AddGroupMemberResponse {
+  bool success = 1;
+}
+
+message RemoveGroupMemberRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+  string operator_id     = 3;
+}
+
+message RemoveGroupMemberResponse {
+  bool success = 1;
+}
+
+message LeaveGroupRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+}
+
+message LeaveGroupResponse {
+  bool success = 1;
+}
+
+message PromoteAdminRequest {
+  string conversation_id = 1;
+  string user_id         = 2;
+  string operator_id     = 3;
+}
+
+message PromoteAdminResponse {
+  bool success = 1;
+}
+
+message TransferOwnershipRequest {
+  string conversation_id  = 1;
+  string current_owner_id = 2;
+  string new_owner_id     = 3;
+}
+
+message TransferOwnershipResponse {
+  bool success = 1;
+}
+
+message DeleteGroupRequest {
+  string conversation_id = 1;
+  string owner_id        = 2;
+}
+
+message DeleteGroupResponse {
+  bool success = 1;
+}
+
 // ── Service ───────────────────────────────────────────────────────────────────
 
 service ChatService {
@@ -199,8 +372,29 @@ service ChatService {
   // Create a DM or group room; DMs are idempotent for the same pair
   rpc CreateRoom(CreateRoomRequest) returns (CreateRoomResponse);
 
+  // Get single conversation details
+  rpc GetConversation(GetConversationRequest) returns (GetConversationResponse);
+
   // Load paginated message history for a room
   rpc GetMessages(GetMessagesRequest) returns (GetMessagesResponse);
+
+  // Send a message via unary RPC
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+
+  // Search messages within a conversation
+  rpc SearchMessages(SearchMessagesRequest) returns (SearchMessagesResponse);
+
+  // Delete message
+  rpc DeleteMessage(DeleteMessageRequest) returns (DeleteMessageResponse);
+
+  // Edit message
+  rpc EditMessage(EditMessageRequest) returns (EditMessageResponse);
+
+  // Mark message as read
+  rpc MarkMessageRead(MarkMessageReadRequest) returns (MarkMessageReadResponse);
+
+  // Get unread count
+  rpc GetUnreadCount(GetUnreadCountRequest) returns (GetUnreadCountResponse);
 
   // Get a presigned HTTP PUT URL to upload a file before sharing in chat
   rpc RequestUpload(UploadRequest) returns (UploadResponse);
@@ -213,5 +407,15 @@ service ChatService {
 
   // Get all active rooms for a user with last-message metadata
   rpc GetUserRooms(GetUserRoomsRequest) returns (GetUserRoomsResponse);
+
+  // Group management RPCs
+  rpc CreateGroup(CreateGroupRequest) returns (CreateGroupResponse);
+  rpc AddGroupMember(AddGroupMemberRequest) returns (AddGroupMemberResponse);
+  rpc RemoveGroupMember(RemoveGroupMemberRequest) returns (RemoveGroupMemberResponse);
+  rpc LeaveGroup(LeaveGroupRequest) returns (LeaveGroupResponse);
+  rpc PromoteAdmin(PromoteAdminRequest) returns (PromoteAdminResponse);
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+  rpc DeleteGroup(DeleteGroupRequest) returns (DeleteGroupResponse);
 }
+
 

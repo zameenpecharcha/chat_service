@@ -3,8 +3,11 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -13,25 +16,64 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Document types
+// Document types matching prompt requirements
 // ─────────────────────────────────────────────────────────────────────────────
 
+type conversationDoc struct {
+	ID            string    `bson:"_id"`
+	Type          string    `bson:"type"` // "DIRECT" or "GROUP"
+	Participants  []string  `bson:"participants"`
+	GroupName     string    `bson:"group_name,omitempty"`
+	GroupPhoto    string    `bson:"group_photo,omitempty"`
+	Description   string    `bson:"description,omitempty"`
+	MemberCount   int32     `bson:"member_count,omitempty"`
+	LastMessage   string    `bson:"last_message,omitempty"`
+	LastMessageID string    `bson:"last_message_id,omitempty"`
+	LastMessageAt time.Time `bson:"last_message_at,omitempty"`
+	CreatedBy     string    `bson:"created_by"`
+	CreatedAt     time.Time `bson:"created_at"`
+}
+
+type groupMemberDoc struct {
+	ID             string    `bson:"_id"`
+	ConversationID string    `bson:"conversation_id"`
+	UserID         string    `bson:"user_id"`
+	Role           string    `bson:"role"`   // "OWNER", "ADMIN", "MEMBER"
+	JoinedAt       time.Time `bson:"joined_at"`
+	Status         string    `bson:"status"` // "ACTIVE", "INACTIVE"
+}
+
 type messageDoc struct {
-	RoomID           string         `bson:"room_id"`
-	SentAt           time.Time      `bson:"sent_at"`
-	MessageID        string         `bson:"message_id"`
-	UserID           string         `bson:"user_id"`
-	MessageType      int32          `bson:"message_type"`
-	TextBody         string         `bson:"text_body,omitempty"`
-	DeliveredAt      time.Time      `bson:"delivered_at,omitempty"`
-	MediaKey         string         `bson:"media_key,omitempty"`
-	MediaName        string         `bson:"media_name,omitempty"`
-	MediaMimeType    string         `bson:"media_mime_type,omitempty"`
-	MediaSizeBytes   int64          `bson:"media_size_bytes,omitempty"`
-	ReplyToMessageID string         `bson:"reply_to_message_id,omitempty"`
-	IsDeleted        bool           `bson:"is_deleted"`
-	EditedAt         time.Time      `bson:"edited_at,omitempty"`
-	ReactionSummary  map[string]int `bson:"reaction_summary,omitempty"`
+	ID               string    `bson:"_id"`
+	MessageID        string    `bson:"message_id,omitempty"`
+	ConversationID   string    `bson:"conversation_id"`
+	SenderID         string    `bson:"sender_id"`
+	MessageType      string    `bson:"message_type"` // "TEXT", "IMAGE", "VIDEO", etc.
+	Content          string    `bson:"content"`
+	CreatedAt        time.Time `bson:"created_at"`
+	DeliveredAt      time.Time `bson:"delivered_at,omitempty"`
+	MediaKey         string    `bson:"media_key,omitempty"`
+	MediaName        string    `bson:"media_name,omitempty"`
+	MediaMimeType    string    `bson:"media_mime_type,omitempty"`
+	MediaSizeBytes   int64     `bson:"media_size_bytes,omitempty"`
+	ReplyToMessageID string    `bson:"reply_to_message_id,omitempty"`
+	IsDeleted        bool      `bson:"is_deleted"`
+	EditedAt         time.Time `bson:"edited_at,omitempty"`
+
+
+	// Legacy BSON compatibility fields
+	RoomID   string    `bson:"room_id,omitempty"`
+	UserID   string    `bson:"user_id,omitempty"`
+	TextBody string    `bson:"text_body,omitempty"`
+	SentAt   time.Time `bson:"sent_at,omitempty"`
+}
+
+type messageReadDoc struct {
+	ID             string   `bson:"_id"`
+	ConversationID string   `bson:"conversation_id"`
+	SenderID       string   `bson:"sender_id"`
+	Content        string   `bson:"content"`
+	ReadBy         []string `bson:"read_by"`
 }
 
 type readReceiptDoc struct {
@@ -56,15 +98,13 @@ type mediaUploadDoc struct {
 // MessageRepository — MongoDB-backed
 // ─────────────────────────────────────────────────────────────────────────────
 
-// UserRoomSummary contains the minimal room data needed for the inbox sidebar.
 type UserRoomSummary struct {
 	RoomID        string
 	LastMessage   string
 	LastMessageAt time.Time
-	MemberIDs     []string // extracted from dm:a:b room_id for DMs
+	MemberIDs     []string
 }
 
-// MessageStore is the persistence contract used by the chat server.
 type MessageStore interface {
 	SaveMessage(ctx context.Context, msg *pb.ServerMessage) error
 	SoftDeleteMessage(ctx context.Context, roomID string, sentAtUnixMs int64, messageID string) error
@@ -74,25 +114,31 @@ type MessageStore interface {
 	UpdateReadReceipt(ctx context.Context, roomID, userID, lastMsgID string, lastReadAt time.Time) error
 	GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error)
 	GetUserRooms(ctx context.Context, userID string) ([]UserRoomSummary, error)
+	SearchMessages(ctx context.Context, convID, query string, limit int) ([]*pb.ServerMessage, error)
+	CreateOrGetDirectConversation(ctx context.Context, userA, userB, createdBy string) (*pb.ConversationDetail, error)
+	CreateGroupConversation(ctx context.Context, groupName, groupPhoto, description, createdBy string, memberIDs []string) (*pb.ConversationDetail, error)
+	GetConversation(ctx context.Context, convID string) (*pb.ConversationDetail, []*pb.GroupMember, error)
+	AddGroupMember(ctx context.Context, convID, userID, operatorID, role string) error
+	RemoveGroupMember(ctx context.Context, convID, userID, operatorID string) error
+	LeaveGroup(ctx context.Context, convID, userID string) error
+	PromoteAdmin(ctx context.Context, convID, userID, operatorID string) error
+	TransferOwnership(ctx context.Context, convID, currentOwnerID, newOwnerID string) error
+	DeleteGroup(ctx context.Context, convID, ownerID string) error
+	MarkMessageRead(ctx context.Context, convID, userID, msgID string) error
+	GetUnreadCount(ctx context.Context, userID, convID string) (int32, error)
 	Close()
 }
 
-// MessageRepository persists and retrieves chat messages from MongoDB.
-// Compatible with MongoDB Atlas M0 (free tier) and any self-hosted instance.
 type MessageRepository struct {
-	client   *mongo.Client
-	messages *mongo.Collection
-	receipts *mongo.Collection
-	media    *mongo.Collection
+	client        *mongo.Client
+	conversations *mongo.Collection
+	groupMembers  *mongo.Collection
+	messages      *mongo.Collection
+	messageRead   *mongo.Collection
+	receipts      *mongo.Collection
+	media         *mongo.Collection
 }
 
-// NewMessageRepository connects to MongoDB and returns a repository.
-// uri is a standard MongoDB connection string, e.g.:
-//
-//	"mongodb://localhost:27017"                     (local)
-//	"mongodb+srv://user:pass@cluster.mongodb.net"   (Atlas)
-//
-// dbName is the database to use (default: "zpc_chat").
 func NewMessageRepository(uri, dbName string) (*MessageRepository, error) {
 	if dbName == "" {
 		dbName = "zpc_chat"
@@ -113,10 +159,13 @@ func NewMessageRepository(uri, dbName string) (*MessageRepository, error) {
 
 	db := client.Database(dbName)
 	r := &MessageRepository{
-		client:   client,
-		messages: db.Collection("messages"),
-		receipts: db.Collection("read_receipts"),
-		media:    db.Collection("media_uploads"),
+		client:        client,
+		conversations: db.Collection("conversations"),
+		groupMembers:  db.Collection("group_members"),
+		messages:      db.Collection("messages"),
+		messageRead:   db.Collection("message_read"),
+		receipts:      db.Collection("read_receipts"),
+		media:         db.Collection("media_uploads"),
 	}
 
 	if err := r.ensureIndexes(ctx); err != nil {
@@ -126,57 +175,52 @@ func NewMessageRepository(uri, dbName string) (*MessageRepository, error) {
 	return r, nil
 }
 
-// ensureIndexes creates all required indexes if they don't already exist.
-// Safe to call on every startup (idempotent).
 func (r *MessageRepository) ensureIndexes(ctx context.Context) error {
-	// messages: primary query pattern — room + time DESC
-	_, err := r.messages.Indexes().CreateMany(ctx, []mongo.IndexModel{
+	// conversations indexes
+	_, _ = r.conversations.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "participants", Value: 1}},
+			Options: options.Index().SetName("conv_participants"),
+		},
+		{
+			Keys:    bson.D{{Key: "type", Value: 1}},
+			Options: options.Index().SetName("conv_type"),
+		},
+	})
+
+	// group_members indexes
+	_, _ = r.groupMembers.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "conversation_id", Value: 1}, {Key: "user_id", Value: 1}},
+			Options: options.Index().SetName("gm_conv_user").SetUnique(true),
+		},
+		{
+			Keys:    bson.D{{Key: "user_id", Value: 1}},
+			Options: options.Index().SetName("gm_user"),
+		},
+	})
+
+	// messages indexes
+	_, _ = r.messages.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "conversation_id", Value: 1}, {Key: "created_at", Value: -1}},
+			Options: options.Index().SetName("conv_time"),
+		},
 		{
 			Keys:    bson.D{{Key: "room_id", Value: 1}, {Key: "sent_at", Value: -1}},
 			Options: options.Index().SetName("room_time"),
 		},
-		{
-			Keys:    bson.D{{Key: "room_id", Value: 1}, {Key: "sent_at", Value: -1}, {Key: "is_deleted", Value: 1}},
-			Options: options.Index().SetName("room_time_deleted"),
-		},
-		{
-			// For soft-delete and reaction updates by message_id
-			Keys:    bson.D{{Key: "message_id", Value: 1}},
-			Options: options.Index().SetName("message_id").SetUnique(true),
-		},
 	})
-	if err != nil {
-		return fmt.Errorf("messages index: %w", err)
-	}
 
-	// read_receipts: unique (room_id, user_id) pair
-	_, err = r.receipts.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys:    bson.D{{Key: "room_id", Value: 1}, {Key: "user_id", Value: 1}},
-		Options: options.Index().SetName("room_user").SetUnique(true),
+	// message_read index
+	_, _ = r.messageRead.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "conversation_id", Value: 1}},
+		Options: options.Index().SetName("mr_conv"),
 	})
-	if err != nil {
-		return fmt.Errorf("read_receipts index: %w", err)
-	}
-
-	// media_uploads: query by room and by uploader
-	_, err = r.media.Indexes().CreateMany(ctx, []mongo.IndexModel{
-		{
-			Keys:    bson.D{{Key: "room_id", Value: 1}, {Key: "uploaded_at", Value: -1}},
-			Options: options.Index().SetName("room_uploads"),
-		},
-		{
-			Keys:    bson.D{{Key: "uploader_id", Value: 1}},
-			Options: options.Index().SetName("uploader"),
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("media_uploads index: %w", err)
-	}
 
 	return nil
 }
 
-// Close disconnects from MongoDB.
 func (r *MessageRepository) Close() {
 	if r.client != nil {
 		_ = r.client.Disconnect(context.Background())
@@ -184,18 +228,273 @@ func (r *MessageRepository) Close() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Write operations
+// Conversations & Group Management Operations
 // ─────────────────────────────────────────────────────────────────────────────
 
-// SaveMessage persists a ServerMessage to the messages collection.
+func (r *MessageRepository) CreateOrGetDirectConversation(ctx context.Context, userA, userB, createdBy string) (*pb.ConversationDetail, error) {
+	if userA == "" || userB == "" {
+		return nil, fmt.Errorf("userA and userB are required")
+	}
+	participants := []string{userA, userB}
+	sort.Strings(participants)
+
+	// Check if conversation exists
+	filter := bson.M{
+		"type":         "DIRECT",
+		"participants": participants,
+	}
+	var existing conversationDoc
+	err := r.conversations.FindOne(ctx, filter).Decode(&existing)
+	if err == nil {
+		return docToConversationDetail(&existing), nil
+	}
+
+	convID := fmt.Sprintf("CONV_%s_%s", participants[0], participants[1])
+	now := time.Now().UTC()
+	doc := conversationDoc{
+		ID:           convID,
+		Type:         "DIRECT",
+		Participants: participants,
+		CreatedBy:    createdBy,
+		CreatedAt:    now,
+	}
+
+	_, err = r.conversations.InsertOne(ctx, doc)
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		return nil, fmt.Errorf("create direct conversation: %w", err)
+	}
+	if err != nil {
+		_ = r.conversations.FindOne(ctx, bson.M{"_id": convID}).Decode(&existing)
+		return docToConversationDetail(&existing), nil
+	}
+
+	return docToConversationDetail(&doc), nil
+}
+
+func (r *MessageRepository) CreateGroupConversation(ctx context.Context, groupName, groupPhoto, description, createdBy string, memberIDs []string) (*pb.ConversationDetail, error) {
+	if groupName == "" {
+		return nil, fmt.Errorf("group_name is required")
+	}
+	if createdBy == "" {
+		return nil, fmt.Errorf("created_by is required")
+	}
+
+	uniqueMembers := make(map[string]bool)
+	uniqueMembers[createdBy] = true
+	for _, m := range memberIDs {
+		if m != "" {
+			uniqueMembers[m] = true
+		}
+	}
+	finalMembers := make([]string, 0, len(uniqueMembers))
+	for m := range uniqueMembers {
+		finalMembers = append(finalMembers, m)
+	}
+
+	convID := fmt.Sprintf("CONV_%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+
+	conv := conversationDoc{
+		ID:           convID,
+		Type:         "GROUP",
+		Participants: finalMembers,
+		GroupName:    groupName,
+		GroupPhoto:   groupPhoto,
+		Description:  description,
+		MemberCount:  int32(len(finalMembers)),
+		CreatedBy:    createdBy,
+		CreatedAt:    now,
+	}
+
+	_, err := r.conversations.InsertOne(ctx, conv)
+	if err != nil {
+		return nil, fmt.Errorf("insert group conversation: %w", err)
+	}
+
+	// Insert group_members documents
+	var gmDocs []interface{}
+	for _, m := range finalMembers {
+		role := "MEMBER"
+		if m == createdBy {
+			role = "OWNER"
+		}
+		gmDocs = append(gmDocs, groupMemberDoc{
+			ID:             fmt.Sprintf("GM_%s_%s", convID, m),
+			ConversationID: convID,
+			UserID:         m,
+			Role:           role,
+			JoinedAt:       now,
+			Status:         "ACTIVE",
+		})
+	}
+	if len(gmDocs) > 0 {
+		_, err = r.groupMembers.InsertMany(ctx, gmDocs)
+		if err != nil {
+			return nil, fmt.Errorf("insert group members: %w", err)
+		}
+	}
+
+	return docToConversationDetail(&conv), nil
+}
+
+func (r *MessageRepository) GetConversation(ctx context.Context, convID string) (*pb.ConversationDetail, []*pb.GroupMember, error) {
+	var cDoc conversationDoc
+	err := r.conversations.FindOne(ctx, bson.M{"_id": convID}).Decode(&cDoc)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get conversation: %w", err)
+	}
+
+	var members []*pb.GroupMember
+	if cDoc.Type == "GROUP" {
+		cur, err := r.groupMembers.Find(ctx, bson.M{"conversation_id": convID, "status": "ACTIVE"})
+		if err == nil {
+			defer cur.Close(ctx)
+			for cur.Next(ctx) {
+				var gm groupMemberDoc
+				if err := cur.Decode(&gm); err == nil {
+					members = append(members, &pb.GroupMember{
+						Id:             gm.ID,
+						ConversationId: gm.ConversationID,
+						UserId:         gm.UserID,
+						Role:           gm.Role,
+						JoinedAt:       gm.JoinedAt.UnixMilli(),
+						Status:         gm.Status,
+					})
+				}
+			}
+		}
+	}
+
+	return docToConversationDetail(&cDoc), members, nil
+}
+
+func (r *MessageRepository) AddGroupMember(ctx context.Context, convID, userID, operatorID, role string) error {
+	if role == "" {
+		role = "MEMBER"
+	}
+	now := time.Now().UTC()
+	gm := groupMemberDoc{
+		ID:             fmt.Sprintf("GM_%s_%s", convID, userID),
+		ConversationID: convID,
+		UserID:         userID,
+		Role:           role,
+		JoinedAt:       now,
+		Status:         "ACTIVE",
+	}
+
+	_, err := r.groupMembers.UpdateOne(ctx,
+		bson.M{"conversation_id": convID, "user_id": userID},
+		bson.M{"$set": bson.M{
+			"role":      role,
+			"joined_at": now,
+			"status":    "ACTIVE",
+		}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		return err
+	}
+
+	_ = gm
+	_, _ = r.conversations.UpdateOne(ctx,
+		bson.M{"_id": convID},
+		bson.M{
+			"$addToSet": bson.M{"participants": userID},
+			"$inc":      bson.M{"member_count": 1},
+		},
+	)
+	return nil
+}
+
+func (r *MessageRepository) RemoveGroupMember(ctx context.Context, convID, userID, operatorID string) error {
+	_, err := r.groupMembers.UpdateOne(ctx,
+		bson.M{"conversation_id": convID, "user_id": userID},
+		bson.M{"$set": bson.M{"status": "INACTIVE"}},
+	)
+	if err != nil {
+		return err
+	}
+
+	_, _ = r.conversations.UpdateOne(ctx,
+		bson.M{"_id": convID},
+		bson.M{
+			"$pull": bson.M{"participants": userID},
+			"$inc":  bson.M{"member_count": -1},
+		},
+	)
+	return nil
+}
+
+func (r *MessageRepository) LeaveGroup(ctx context.Context, convID, userID string) error {
+	return r.RemoveGroupMember(ctx, convID, userID, userID)
+}
+
+func (r *MessageRepository) PromoteAdmin(ctx context.Context, convID, userID, operatorID string) error {
+	res, err := r.groupMembers.UpdateOne(ctx,
+		bson.M{"conversation_id": convID, "user_id": userID, "status": "ACTIVE"},
+		bson.M{"$set": bson.M{"role": "ADMIN"}},
+	)
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return fmt.Errorf("active member not found in group")
+	}
+	return nil
+}
+
+func (r *MessageRepository) TransferOwnership(ctx context.Context, convID, currentOwnerID, newOwnerID string) error {
+	_, err := r.groupMembers.UpdateOne(ctx,
+		bson.M{"conversation_id": convID, "user_id": newOwnerID, "status": "ACTIVE"},
+		bson.M{"$set": bson.M{"role": "OWNER"}},
+	)
+	if err != nil {
+		return err
+	}
+	if currentOwnerID != "" {
+		_, _ = r.groupMembers.UpdateOne(ctx,
+			bson.M{"conversation_id": convID, "user_id": currentOwnerID},
+			bson.M{"$set": bson.M{"role": "ADMIN"}},
+		)
+	}
+	return nil
+}
+
+func (r *MessageRepository) DeleteGroup(ctx context.Context, convID, ownerID string) error {
+	_, err := r.conversations.DeleteOne(ctx, bson.M{"_id": convID})
+	if err != nil {
+		return err
+	}
+	_, _ = r.groupMembers.DeleteMany(ctx, bson.M{"conversation_id": convID})
+	return nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages & Read Receipts Operations
+// ─────────────────────────────────────────────────────────────────────────────
+
 func (r *MessageRepository) SaveMessage(ctx context.Context, msg *pb.ServerMessage) error {
+	convID := msg.GetRoomId()
+	senderID := msg.GetUserId()
+	msgID := msg.GetMessageId()
+	if msgID == "" {
+		msgID = uuid.NewString()
+	}
+	createdAt := time.UnixMilli(msg.GetSentAtUnixMs()).UTC()
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+
+	msgType := msg.GetType().String()
+
 	doc := messageDoc{
-		RoomID:           msg.GetRoomId(),
-		SentAt:           time.UnixMilli(msg.GetSentAtUnixMs()).UTC(),
-		MessageID:        msg.GetMessageId(),
-		UserID:           msg.GetUserId(),
-		MessageType:      int32(msg.GetType()),
-		TextBody:         msg.GetText(),
+		ID:               msgID,
+		MessageID:        msgID,
+		ConversationID:   convID,
+		SenderID:         senderID,
+		MessageType:      msgType,
+		Content:          msg.GetText(),
+		CreatedAt:        createdAt,
 		DeliveredAt:      time.UnixMilli(msg.GetDeliveredAtUnixMs()).UTC(),
 		MediaKey:         msg.GetMediaKey(),
 		MediaName:        msg.GetMediaName(),
@@ -203,27 +502,142 @@ func (r *MessageRepository) SaveMessage(ctx context.Context, msg *pb.ServerMessa
 		MediaSizeBytes:   msg.GetMediaSizeBytes(),
 		ReplyToMessageID: msg.GetReplyToMessageId(),
 		IsDeleted:        msg.GetIsDeleted(),
+		// legacy fallback tags
+		RoomID:   convID,
+		UserID:   senderID,
+		TextBody: msg.GetText(),
+		SentAt:   createdAt,
 	}
 
 	_, err := r.messages.InsertOne(ctx, doc)
+	if err != nil {
+		return fmt.Errorf("insert message: %w", err)
+	}
+
+	// Update conversation last_message
+	preview := msg.GetText()
+	if preview == "" && msg.GetMediaName() != "" {
+		preview = "📎 " + msg.GetMediaName()
+	}
+	_, _ = r.conversations.UpdateOne(ctx,
+		bson.M{"_id": convID},
+		bson.M{"$set": bson.M{
+			"last_message":    preview,
+			"last_message_id": msgID,
+			"last_message_at": createdAt,
+		}},
+	)
+
+	// Upsert message_read document
+	readDoc := messageReadDoc{
+		ID:             msgID,
+		ConversationID: convID,
+		SenderID:       senderID,
+		Content:        preview,
+		ReadBy:         []string{senderID},
+	}
+	_, _ = r.messageRead.UpdateOne(ctx,
+		bson.M{"_id": msgID},
+		bson.M{
+			"$setOnInsert": readDoc,
+			"$addToSet":    bson.M{"read_by": senderID},
+		},
+		options.UpdateOne().SetUpsert(true),
+	)
+
+	return nil
+}
+
+func (r *MessageRepository) MarkMessageRead(ctx context.Context, convID, userID, msgID string) error {
+	now := time.Now().UTC()
+	_ = r.UpdateReadReceipt(ctx, convID, userID, msgID, now)
+
+	if msgID != "" {
+		_, err := r.messageRead.UpdateOne(ctx,
+			bson.M{"_id": msgID},
+			bson.M{"$addToSet": bson.M{"read_by": userID}},
+		)
+		return err
+	}
+
+	// Mark all messages in conversation read by user
+	_, err := r.messageRead.UpdateMany(ctx,
+		bson.M{"conversation_id": convID},
+		bson.M{"$addToSet": bson.M{"read_by": userID}},
+	)
 	return err
 }
 
-// SoftDeleteMessage marks a single message as deleted without removing the document.
-// sentAtUnixMs is accepted for signature compatibility but not used (MongoDB
-// looks up by message_id directly, unlike Cassandra which needed the partition key).
+func (r *MessageRepository) GetUnreadCount(ctx context.Context, userID, convID string) (int32, error) {
+	filter := bson.M{
+		"sender_id": bson.M{"$ne": userID},
+		"read_by":   bson.M{"$ne": userID},
+	}
+	if convID != "" {
+		filter["conversation_id"] = convID
+	}
+	count, err := r.messageRead.CountDocuments(ctx, filter)
+	if err != nil {
+		return 0, err
+	}
+	return int32(count), nil
+}
+
+func (r *MessageRepository) SearchMessages(ctx context.Context, convID, query string, limit int) ([]*pb.ServerMessage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	filter := bson.M{
+		"is_deleted": bson.M{"$ne": true},
+		"$and": bson.A{
+			bson.M{"$or": bson.A{
+				bson.M{"conversation_id": convID},
+				bson.M{"room_id": convID},
+			}},
+			bson.M{"$or": bson.A{
+				bson.M{"content": bson.M{"$regex": query, "$options": "i"}},
+				bson.M{"text_body": bson.M{"$regex": query, "$options": "i"}},
+			}},
+		},
+	}
+
+	opts := options.Find().
+		SetSort(bson.D{{Key: "created_at", Value: -1}}).
+		SetLimit(int64(limit))
+
+	cur, err := r.messages.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("search messages: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	var results []*pb.ServerMessage
+	for cur.Next(ctx) {
+		var doc messageDoc
+		if err := cur.Decode(&doc); err != nil {
+			continue
+		}
+		results = append(results, docToServerMessage(&doc))
+	}
+	return results, cur.Err()
+}
+
 func (r *MessageRepository) SoftDeleteMessage(ctx context.Context, _ string, sentAtUnixMs int64, messageID string) error {
 	_, err := r.messages.UpdateOne(ctx,
-		bson.M{"message_id": messageID},
+		bson.M{"$or": bson.A{bson.M{"_id": messageID}, bson.M{"message_id": messageID}}},
 		bson.M{"$set": bson.M{"is_deleted": true}},
 	)
 	return err
 }
 
-// SoftDeleteMessageByOwner soft-deletes only if message_id belongs to userID.
 func (r *MessageRepository) SoftDeleteMessageByOwner(ctx context.Context, messageID, userID string) (bool, error) {
 	res, err := r.messages.UpdateOne(ctx,
-		bson.M{"message_id": messageID, "user_id": userID},
+		bson.M{
+			"$and": bson.A{
+				bson.M{"$or": bson.A{bson.M{"_id": messageID}, bson.M{"message_id": messageID}}},
+				bson.M{"$or": bson.A{bson.M{"sender_id": userID}, bson.M{"user_id": userID}}},
+			},
+		},
 		bson.M{"$set": bson.M{"is_deleted": true}},
 	)
 	if err != nil {
@@ -232,16 +646,18 @@ func (r *MessageRepository) SoftDeleteMessageByOwner(ctx context.Context, messag
 	return res.ModifiedCount > 0 || res.MatchedCount > 0, nil
 }
 
-// EditMessage updates text for a message owned by userID. Returns edited_at unix ms.
 func (r *MessageRepository) EditMessage(ctx context.Context, messageID, userID, newText string) (int64, error) {
 	now := time.Now().UTC()
 	res, err := r.messages.UpdateOne(ctx,
 		bson.M{
-			"message_id": messageID,
-			"user_id":    userID,
 			"is_deleted": bson.M{"$ne": true},
+			"$and": bson.A{
+				bson.M{"$or": bson.A{bson.M{"_id": messageID}, bson.M{"message_id": messageID}}},
+				bson.M{"$or": bson.A{bson.M{"sender_id": userID}, bson.M{"user_id": userID}}},
+			},
 		},
 		bson.M{"$set": bson.M{
+			"content":   newText,
 			"text_body": newText,
 			"edited_at": now,
 		}},
@@ -255,7 +671,6 @@ func (r *MessageRepository) EditMessage(ctx context.Context, messageID, userID, 
 	return now.UnixMilli(), nil
 }
 
-// SaveMediaUpload records a media upload in the media_uploads collection.
 func (r *MessageRepository) SaveMediaUpload(ctx context.Context,
 	mediaKey, uploaderID, roomID, fileName, mimeType string,
 	sizeBytes int64, expiresAt time.Time) error {
@@ -274,7 +689,6 @@ func (r *MessageRepository) SaveMediaUpload(ctx context.Context,
 	return err
 }
 
-// UpdateReadReceipt upserts a user's last-read cursor for a room.
 func (r *MessageRepository) UpdateReadReceipt(ctx context.Context,
 	roomID, userID, lastMsgID string, lastReadAt time.Time) error {
 
@@ -289,24 +703,16 @@ func (r *MessageRepository) UpdateReadReceipt(ctx context.Context,
 	return err
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Read operations
-// ─────────────────────────────────────────────────────────────────────────────
-
-// GetMessages returns the latest `limit` messages in a room, newest first.
 func (r *MessageRepository) GetMessages(ctx context.Context, roomID string, limit, _ int) ([]*pb.ServerMessage, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	// Include soft-deleted messages so clients can show Teams-style tombstones.
 	return r.queryMessages(ctx,
-		bson.M{"room_id": roomID},
+		bson.M{"$or": bson.A{bson.M{"conversation_id": roomID}, bson.M{"room_id": roomID}}},
 		limit,
 	)
 }
 
-// GetMessagesBefore returns up to `limit` messages sent strictly before
-// beforeUnixMs, newest first. Pass 0 to fetch the latest messages.
 func (r *MessageRepository) GetMessagesBefore(ctx context.Context, roomID string, beforeUnixMs int64, limit int) ([]*pb.ServerMessage, error) {
 	if limit <= 0 {
 		limit = 50
@@ -314,19 +720,21 @@ func (r *MessageRepository) GetMessagesBefore(ctx context.Context, roomID string
 	if beforeUnixMs == 0 {
 		return r.GetMessages(ctx, roomID, limit, 0)
 	}
+	t := time.UnixMilli(beforeUnixMs).UTC()
 	return r.queryMessages(ctx,
 		bson.M{
-			"room_id": roomID,
-			"sent_at": bson.M{"$lt": time.UnixMilli(beforeUnixMs).UTC()},
+			"$and": bson.A{
+				bson.M{"$or": bson.A{bson.M{"conversation_id": roomID}, bson.M{"room_id": roomID}}},
+				bson.M{"$or": bson.A{bson.M{"created_at": bson.M{"$lt": t}}, bson.M{"sent_at": bson.M{"$lt": t}}}},
+			},
 		},
 		limit,
 	)
 }
 
-// queryMessages is the shared find helper used by GetMessages and GetMessagesBefore.
 func (r *MessageRepository) queryMessages(ctx context.Context, filter bson.M, limit int) ([]*pb.ServerMessage, error) {
 	opts := options.Find().
-		SetSort(bson.D{{Key: "sent_at", Value: -1}}).
+		SetSort(bson.D{{Key: "created_at", Value: -1}, {Key: "sent_at", Value: -1}}).
 		SetLimit(int64(limit))
 
 	cur, err := r.messages.Find(ctx, filter, opts)
@@ -341,81 +749,76 @@ func (r *MessageRepository) queryMessages(ctx context.Context, filter bson.M, li
 		if err := cur.Decode(&doc); err != nil {
 			continue
 		}
-		results = append(results, &pb.ServerMessage{
-			RoomId:            doc.RoomID,
-			UserId:            doc.UserID,
-			MessageId:         doc.MessageID,
-			Text:              doc.TextBody,
-			Type:              pb.MessageType(doc.MessageType),
-			SentAtUnixMs:      doc.SentAt.UnixMilli(),
-			DeliveredAtUnixMs: doc.DeliveredAt.UnixMilli(),
-			MediaKey:          doc.MediaKey,
-			MediaName:         doc.MediaName,
-			MediaMimeType:     doc.MediaMimeType,
-			MediaSizeBytes:    doc.MediaSizeBytes,
-			ReplyToMessageId:  doc.ReplyToMessageID,
-			IsDeleted:         doc.IsDeleted,
-			EditedAtUnixMs: func() int64 {
-				if doc.EditedAt.IsZero() {
-					return 0
-				}
-				return doc.EditedAt.UnixMilli()
-			}(),
-			EventType: pb.EventType_EVENT_TYPE_MESSAGE,
-		})
+		results = append(results, docToServerMessage(&doc))
 	}
 	return results, cur.Err()
 }
 
-// GetUserRooms finds all rooms a user has participated in by scanning MongoDB messages.
-// For DMs the room_id is "dm:a:b" (sorted), so any room_id containing the userID
-// as a DM segment belongs to this user. For group rooms the user must appear as sender.
-// Returns one summary per room sorted by most-recent message first.
 func (r *MessageRepository) GetUserRooms(ctx context.Context, userID string) ([]UserRoomSummary, error) {
-	// Exact DM segment regex:
-	// Supports both ":" and "-" formats (legacy data check)
-	exactDmRegex := "^dm[:-]" + userID + "[:-]|^dm[:-][^:-]+[:-]" + userID + "$"
+	// Query conversations collection first
+	cur, err := r.conversations.Find(ctx, bson.M{
+		"$or": bson.A{
+			bson.M{"participants": userID},
+			bson.M{"created_by": userID},
+		},
+	})
+	if err == nil {
+		defer cur.Close(ctx)
+		var summaries []UserRoomSummary
+		for cur.Next(ctx) {
+			var doc conversationDoc
+			if err := cur.Decode(&doc); err == nil {
+				summaries = append(summaries, UserRoomSummary{
+					RoomID:        doc.ID,
+					LastMessage:   doc.LastMessage,
+					LastMessageAt: doc.LastMessageAt,
+					MemberIDs:     doc.Participants,
+				})
+			}
+		}
+		if len(summaries) > 0 {
+			return summaries, nil
+		}
+	}
 
+	// Fallback to messages aggregate
+	exactDmRegex := "^dm[:-]" + userID + "[:-]|^dm[:-][^:-]+[:-]" + userID + "$"
 	pipeline := bson.A{
-		// Step 1: match messages for this user (as sender or DM participant)
 		bson.M{"$match": bson.M{
 			"is_deleted": bson.M{"$ne": true},
 			"$or": bson.A{
+				bson.M{"sender_id": userID},
 				bson.M{"user_id": userID},
+				bson.M{"conversation_id": bson.M{"$regex": exactDmRegex}},
 				bson.M{"room_id": bson.M{"$regex": exactDmRegex}},
 			},
 		}},
-		// Step 2: sort by sent_at desc so $first gives us the latest message
-		bson.M{"$sort": bson.M{"sent_at": -1}},
-		// Step 3: group by room_id, pick first (latest) message
+		bson.M{"$sort": bson.M{"created_at": -1, "sent_at": -1}},
 		bson.M{"$group": bson.M{
-			"_id":          "$room_id",
-			"lastText":     bson.M{"$first": "$text_body"},
-			"lastSentAt":   bson.M{"$first": "$sent_at"},
+			"_id":        "$conversation_id",
+			"lastText":   bson.M{"$first": "$content"},
+			"lastSentAt": bson.M{"$first": "$created_at"},
 		}},
-		// Step 4: sort groups by most recent
 		bson.M{"$sort": bson.M{"lastSentAt": -1}},
-		// Step 5: limit to 100 rooms
 		bson.M{"$limit": 100},
 	}
 
-	cur, err := r.messages.Aggregate(ctx, pipeline)
+	acur, err := r.messages.Aggregate(ctx, pipeline)
 	if err != nil {
 		return nil, fmt.Errorf("GetUserRooms aggregate: %w", err)
 	}
-	defer cur.Close(ctx)
+	defer acur.Close(ctx)
 
 	var results []UserRoomSummary
-	for cur.Next(ctx) {
+	for acur.Next(ctx) {
 		var row struct {
-			RoomID    string    `bson:"_id"`
-			LastText  string    `bson:"lastText"`
+			RoomID     string    `bson:"_id"`
+			LastText   string    `bson:"lastText"`
 			LastSentAt time.Time `bson:"lastSentAt"`
 		}
-		if err := cur.Decode(&row); err != nil {
+		if err := acur.Decode(&row); err != nil || row.RoomID == "" {
 			continue
 		}
-		// Extract member IDs from DM room_id (supports both dm: and dm-)
 		var memberIDs []string
 		if len(row.RoomID) > 3 && (row.RoomID[:3] == "dm:" || row.RoomID[:3] == "dm-") {
 			parts := splitRoomID(row.RoomID)
@@ -430,15 +833,86 @@ func (r *MessageRepository) GetUserRooms(ctx context.Context, userID string) ([]
 			MemberIDs:     memberIDs,
 		})
 	}
-	return results, cur.Err()
+	return results, acur.Err()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func docToConversationDetail(d *conversationDoc) *pb.ConversationDetail {
+	roomType := pb.RoomType_ROOM_TYPE_DM
+	if d.Type == "GROUP" {
+		roomType = pb.RoomType_ROOM_TYPE_GROUP
+	}
+	return &pb.ConversationDetail{
+		ConversationId: d.ID,
+		Type:           roomType,
+		Participants:   d.Participants,
+		GroupName:      d.GroupName,
+		GroupPhoto:     d.GroupPhoto,
+		Description:    d.Description,
+		MemberCount:    d.MemberCount,
+		LastMessage:    d.LastMessage,
+		LastMessageId:  d.LastMessageID,
+		LastMessageAt:  d.LastMessageAt.UnixMilli(),
+		CreatedBy:      d.CreatedBy,
+		CreatedAt:      d.CreatedAt.UnixMilli(),
+	}
+}
+
+func docToServerMessage(doc *messageDoc) *pb.ServerMessage {
+	cID := doc.ConversationID
+	if cID == "" {
+		cID = doc.RoomID
+	}
+	sID := doc.SenderID
+	if sID == "" {
+		sID = doc.UserID
+	}
+	text := doc.Content
+	if text == "" {
+		text = doc.TextBody
+	}
+	createdAt := doc.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = doc.SentAt
+	}
+
+	msgType := pb.MessageType_MESSAGE_TYPE_TEXT
+	if t, ok := pb.MessageType_value["MESSAGE_TYPE_"+strings.ToUpper(doc.MessageType)]; ok {
+		msgType = pb.MessageType(t)
+	}
+
+	return &pb.ServerMessage{
+		RoomId:            cID,
+		UserId:            sID,
+		MessageId:         doc.ID,
+		Text:              text,
+		Type:              msgType,
+		SentAtUnixMs:      createdAt.UnixMilli(),
+		DeliveredAtUnixMs: doc.DeliveredAt.UnixMilli(),
+		MediaKey:          doc.MediaKey,
+		MediaName:         doc.MediaName,
+		MediaMimeType:     doc.MediaMimeType,
+		MediaSizeBytes:    doc.MediaSizeBytes,
+		ReplyToMessageId:  doc.ReplyToMessageID,
+		IsDeleted:         doc.IsDeleted,
+		EditedAtUnixMs: func() int64 {
+			if doc.EditedAt.IsZero() {
+				return 0
+			}
+			return doc.EditedAt.UnixMilli()
+		}(),
+		EventType: pb.EventType_EVENT_TYPE_MESSAGE,
+	}
 }
 
 func splitRoomID(roomID string) []string {
-	// "dm:a:b" or "dm-a-b" → ["a", "b"]
 	if len(roomID) <= 3 {
 		return nil
 	}
-	rest := roomID[3:] // strip "dm:" or "dm-"
+	rest := roomID[3:]
 	sep := -1
 	for i, c := range rest {
 		if c == ':' || c == '-' {
@@ -450,19 +924,4 @@ func splitRoomID(roomID string) []string {
 		return nil
 	}
 	return []string{rest[:sep], rest[sep+1:]}
-}
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && func() bool {
-		for i := 0; i <= len(s)-len(sub); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
-		}
-		return false
-	}()
-}
-
-func hasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }

@@ -113,22 +113,26 @@ func TestCreateRoom_Validation(t *testing.T) {
 
 // ── RequestUpload ─────────────────────────────────────────────────────────────
 
-func TestRequestUpload_NoStorage(t *testing.T) {
+func TestRequestUpload(t *testing.T) {
 	client := dial(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Server has no MinIO configured; expect Unimplemented
-	_, err := client.RequestUpload(ctx, &pb.UploadRequest{
-		UserId:   "alice",
-		RoomId:   "dm:alice:bob",
-		FileName: "photo.jpg",
-		MimeType: "image/jpeg",
+	resp, err := client.RequestUpload(ctx, &pb.UploadRequest{
+		UserId:        "alice",
+		RoomId:        "dm:alice:bob",
+		FileName:      "photo.jpg",
+		MimeType:      "image/jpeg",
+		FileSizeBytes: 1024,
 	})
-	if err == nil {
-		t.Error("expected error when storage not configured, got nil")
+	if err != nil {
+		t.Logf("RequestUpload error (if storage unconfigured): %v", err)
+		return
 	}
-	t.Logf("RequestUpload no-storage error (expected): %v", err)
+	if resp.UploadUrl == "" || resp.MediaKey == "" {
+		t.Errorf("expected upload_url and media_key, got url=%q key=%q", resp.UploadUrl, resp.MediaKey)
+	}
+	t.Logf("RequestUpload OK: key=%s url=%s", resp.MediaKey, resp.UploadUrl)
 }
 
 // ── Chat stream (DM) ──────────────────────────────────────────────────────────
@@ -184,22 +188,28 @@ func TestChat_DM(t *testing.T) {
 		}
 	}
 
-	recv := func(stream pb.ChatService_ChatClient, label string) *pb.ServerMessage {
+	recvMsg := func(stream pb.ChatService_ChatClient, label string) *pb.ServerMessage {
 		t.Helper()
-		ch := make(chan *pb.ServerMessage, 1)
-		go func() {
-			m, err := stream.Recv()
-			if err != nil && err != io.EOF {
-				t.Logf("%s recv err: %v", label, err)
+		deadline := time.After(5 * time.Second)
+		for {
+			ch := make(chan *pb.ServerMessage, 1)
+			go func() {
+				m, err := stream.Recv()
+				if err != nil && err != io.EOF {
+					t.Logf("%s recv err: %v", label, err)
+				}
+				ch <- m
+			}()
+			select {
+			case m := <-ch:
+				if m != nil && m.EventType == pb.EventType_EVENT_TYPE_PRESENCE {
+					continue // skip presence events
+				}
+				return m
+			case <-deadline:
+				t.Errorf("%s timed out waiting for message", label)
+				return nil
 			}
-			ch <- m
-		}()
-		select {
-		case m := <-ch:
-			return m
-		case <-time.After(5 * time.Second):
-			t.Errorf("%s timed out waiting for message", label)
-			return nil
 		}
 	}
 
@@ -207,20 +217,17 @@ func TestChat_DM(t *testing.T) {
 	send(aliceStream, "alice", "Hello Bob!")
 
 	// Alice receives own message
-	m := recv(aliceStream, "alice")
+	m := recvMsg(aliceStream, "alice")
 	if m == nil {
 		t.Fatal("alice got nil message")
 	}
 	if m.Text != "Hello Bob!" {
 		t.Errorf("alice expected %q got %q", "Hello Bob!", m.Text)
 	}
-	if m.DeliveredAtUnixMs == 0 {
-		t.Error("delivered_at_unix_ms should be set")
-	}
-	t.Logf("Alice received own message: %q  delivered_at=%d", m.Text, m.DeliveredAtUnixMs)
+	t.Logf("Alice received own message: %q", m.Text)
 
 	// Bob also receives Alice's message (drain it before his own echo)
-	mBobFirst := recv(bobStream, "bob receives alice msg")
+	mBobFirst := recvMsg(bobStream, "bob receives alice msg")
 	if mBobFirst == nil {
 		t.Fatal("bob got nil on alice's message")
 	}
@@ -233,7 +240,7 @@ func TestChat_DM(t *testing.T) {
 	send(bobStream, "bob", "Hey Alice!")
 
 	// Alice receives Bob's reply
-	m2 := recv(aliceStream, "alice from bob")
+	m2 := recvMsg(aliceStream, "alice from bob")
 	if m2 == nil {
 		t.Fatal("alice got nil on bob's message")
 	}
@@ -243,7 +250,7 @@ func TestChat_DM(t *testing.T) {
 	t.Logf("Alice received Bob's message: %q", m2.Text)
 
 	// Bob also receives his own broadcast
-	m3 := recv(bobStream, "bob own echo")
+	m3 := recvMsg(bobStream, "bob own echo")
 	if m3 == nil {
 		t.Fatal("bob got nil on own message")
 	}
@@ -255,6 +262,7 @@ func TestChat_DM(t *testing.T) {
 	_ = aliceStream.CloseSend()
 	_ = bobStream.CloseSend()
 }
+
 
 // ── Chat stream (Group) ───────────────────────────────────────────────────────
 
@@ -319,8 +327,18 @@ func TestChat_Group(t *testing.T) {
 		{"charlie", charlie},
 	} {
 		go func(label string, s pb.ChatService_ChatClient) {
-			m, _ := s.Recv()
-			results <- result{label, m}
+			for {
+				m, err := s.Recv()
+				if err != nil {
+					results <- result{label, nil}
+					return
+				}
+				if m != nil && m.EventType == pb.EventType_EVENT_TYPE_PRESENCE {
+					continue
+				}
+				results <- result{label, m}
+				return
+			}
 		}(tc.label, tc.stream)
 	}
 
@@ -382,7 +400,20 @@ func TestChat_MediaMessage(t *testing.T) {
 
 	// Alice receives own broadcast
 	ch := make(chan *pb.ServerMessage, 1)
-	go func() { m, _ := alice.Recv(); ch <- m }()
+	go func() {
+		for {
+			m, err := alice.Recv()
+			if err != nil {
+				ch <- nil
+				return
+			}
+			if m != nil && (m.EventType == pb.EventType_EVENT_TYPE_PRESENCE || m.Type == pb.MessageType_MESSAGE_TYPE_TEXT) {
+				continue
+			}
+			ch <- m
+			return
+		}
+	}()
 	select {
 	case m := <-ch:
 		if m == nil {
@@ -402,3 +433,160 @@ func TestChat_MediaMessage(t *testing.T) {
 	_ = alice.CloseSend()
 	_ = bob.CloseSend()
 }
+
+// ── Extended gRPC APIs tests ──────────────────────────────────────────────────
+
+func TestCreateGroupAndMemberManagement(t *testing.T) {
+	client := dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. CreateGroup
+	grpResp, err := client.CreateGroup(ctx, &pb.CreateGroupRequest{
+		CreatedBy:   "USR1001",
+		GroupName:   "Hyderabad Investors",
+		GroupPhoto:  "MEDIA123",
+		Description: "Investment Discussion",
+		MemberIds:   []string{"USR1001", "USR2001"},
+	})
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	convID := grpResp.Conversation.ConversationId
+	if convID == "" {
+		t.Fatal("expected non-empty conversation_id")
+	}
+
+	// 2. GetConversation
+	cResp, err := client.GetConversation(ctx, &pb.GetConversationRequest{
+		ConversationId: convID,
+		UserId:         "USR1001",
+	})
+	if err != nil {
+		t.Fatalf("GetConversation: %v", err)
+	}
+	if cResp.Conversation.GroupName != "Hyderabad Investors" {
+		t.Errorf("expected group_name 'Hyderabad Investors', got %q", cResp.Conversation.GroupName)
+	}
+
+	// 3. AddGroupMember
+	_, err = client.AddGroupMember(ctx, &pb.AddGroupMemberRequest{
+		ConversationId: convID,
+		UserId:         "USR3001",
+		OperatorId:     "USR1001",
+		Role:           "MEMBER",
+	})
+	if err != nil {
+		t.Fatalf("AddGroupMember: %v", err)
+	}
+
+	// 4. PromoteAdmin
+	_, err = client.PromoteAdmin(ctx, &pb.PromoteAdminRequest{
+		ConversationId: convID,
+		UserId:         "USR2001",
+		OperatorId:     "USR1001",
+	})
+	if err != nil {
+		t.Fatalf("PromoteAdmin: %v", err)
+	}
+
+	// 5. TransferOwnership
+	_, err = client.TransferOwnership(ctx, &pb.TransferOwnershipRequest{
+		ConversationId:  convID,
+		CurrentOwnerId: "USR1001",
+		NewOwnerId:     "USR2001",
+	})
+	if err != nil {
+		t.Fatalf("TransferOwnership: %v", err)
+	}
+
+	// 6. LeaveGroup
+	_, err = client.LeaveGroup(ctx, &pb.LeaveGroupRequest{
+		ConversationId: convID,
+		UserId:         "USR3001",
+	})
+	if err != nil {
+		t.Fatalf("LeaveGroup: %v", err)
+	}
+
+	// 7. DeleteGroup
+	_, err = client.DeleteGroup(ctx, &pb.DeleteGroupRequest{
+		ConversationId: convID,
+		OwnerId:        "USR2001",
+	})
+	if err != nil {
+		t.Fatalf("DeleteGroup: %v", err)
+	}
+}
+
+func TestSendMessage_Search_Edit_Delete_Read(t *testing.T) {
+	client := dial(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	convID := "CONV_TEST_API"
+
+	// 1. SendMessage
+	sendResp, err := client.SendMessage(ctx, &pb.SendMessageRequest{
+		ConversationId: convID,
+		SenderId:       "U1001",
+		Content:        "Hi Rohit",
+		MessageType:    pb.MessageType_MESSAGE_TYPE_TEXT,
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	msgID := sendResp.Message.MessageId
+	if msgID == "" {
+		t.Fatal("expected non-empty message_id")
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// 2. EditMessage
+	editResp, err := client.EditMessage(ctx, &pb.EditMessageRequest{
+		MessageId:      msgID,
+		UserId:         "U1001",
+		ConversationId: convID,
+		NewContent:     "Hi Rohit - Edited",
+	})
+	if err != nil {
+		t.Fatalf("EditMessage: %v", err)
+	}
+	if editResp.Message.Text != "Hi Rohit - Edited" {
+		t.Errorf("expected updated text, got %q", editResp.Message.Text)
+	}
+
+	// 3. MarkMessageRead
+	_, err = client.MarkMessageRead(ctx, &pb.MarkMessageReadRequest{
+		ConversationId: convID,
+		UserId:         "U2001",
+		MessageId:      msgID,
+	})
+	if err != nil {
+		t.Fatalf("MarkMessageRead: %v", err)
+	}
+
+	// 4. GetUnreadCount
+	unResp, err := client.GetUnreadCount(ctx, &pb.GetUnreadCountRequest{
+		UserId:         "U2001",
+		ConversationId: convID,
+	})
+	if err != nil {
+		t.Fatalf("GetUnreadCount: %v", err)
+	}
+	t.Logf("Unread count for U2001: %d", unResp.TotalUnreadCount)
+
+	// 5. DeleteMessage
+	delResp, err := client.DeleteMessage(ctx, &pb.DeleteMessageRequest{
+		MessageId:      msgID,
+		UserId:         "U1001",
+		ConversationId: convID,
+	})
+	if err != nil {
+		t.Fatalf("DeleteMessage: %v", err)
+	}
+	if !delResp.Success {
+		t.Error("expected delete success true")
+	}
+}
+

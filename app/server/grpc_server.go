@@ -364,6 +364,12 @@ func (s *ChatServer) CreateRoom(ctx context.Context, req *pb.CreateRoomRequest) 
 		if len(req.GetMemberIds()) != 2 {
 			return nil, status.Error(codes.InvalidArgument, "DM requires exactly 2 member_ids")
 		}
+		if s.msgRepo != nil {
+			conv, err := s.msgRepo.CreateOrGetDirectConversation(ctx, req.GetMemberIds()[0], req.GetMemberIds()[1], req.GetCreatedBy())
+			if err == nil {
+				return &pb.CreateRoomResponse{RoomId: conv.ConversationId, Name: ""}, nil
+			}
+		}
 		if s.pgRooms != nil {
 			meta, err := s.pgRooms.GetOrCreateDM(ctx,
 				req.GetMemberIds()[0], req.GetMemberIds()[1], req.GetCreatedBy())
@@ -382,6 +388,12 @@ func (s *ChatServer) CreateRoom(ctx context.Context, req *pb.CreateRoomRequest) 
 	case pb.RoomType_ROOM_TYPE_GROUP:
 		if req.GetName() == "" {
 			return nil, status.Error(codes.InvalidArgument, "name is required for a group room")
+		}
+		if s.msgRepo != nil {
+			conv, err := s.msgRepo.CreateGroupConversation(ctx, req.GetName(), "", "", req.GetCreatedBy(), req.GetMemberIds())
+			if err == nil {
+				return &pb.CreateRoomResponse{RoomId: conv.ConversationId, Name: conv.GroupName}, nil
+			}
 		}
 		if s.pgRooms != nil {
 			roomID := "group:" + uuid.NewString()
@@ -527,7 +539,262 @@ func (s *ChatServer) GetUserRooms(ctx context.Context, req *pb.GetUserRoomsReque
 	return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
 }
 
+// ── GetConversation ───────────────────────────────────────────────────────────
+
+func (s *ChatServer) GetConversation(ctx context.Context, req *pb.GetConversationRequest) (*pb.GetConversationResponse, error) {
+	if req.GetConversationId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id is required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	conv, members, err := s.msgRepo.GetConversation(ctx, req.GetConversationId())
+	if err != nil {
+		return nil, status.Errorf(codes.NotFound, "conversation not found: %v", err)
+	}
+	return &pb.GetConversationResponse{
+		Conversation: conv,
+		Members:      members,
+	}, nil
+}
+
+// ── SendMessage ───────────────────────────────────────────────────────────────
+
+func (s *ChatServer) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	convID := normalizeRoomID(req.GetConversationId())
+	if convID == "" || req.GetSenderId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and sender_id are required")
+	}
+
+	msgID := uuid.NewString()
+	nowMs := time.Now().UnixMilli()
+
+	sm := &pb.ServerMessage{
+		RoomId:            convID,
+		UserId:            req.GetSenderId(),
+		MessageId:         msgID,
+		Text:              req.GetContent(),
+		SentAtUnixMs:      nowMs,
+		DeliveredAtUnixMs: nowMs,
+		Type:              req.GetMessageType(),
+		MediaKey:          req.GetMediaKey(),
+		MediaName:         req.GetMediaName(),
+		MediaSizeBytes:    req.GetMediaSizeBytes(),
+		MediaMimeType:     req.GetMediaMimeType(),
+		ReplyToMessageId:  req.GetReplyToMessageId(),
+		EventType:         pb.EventType_EVENT_TYPE_MESSAGE,
+		Status:            pb.MessageStatus_MESSAGE_STATUS_SENT,
+	}
+
+	s.hub.Broadcast(ctx, sm, true)
+	s.persistMessage(ctx, sm)
+
+	return &pb.SendMessageResponse{Message: sm}, nil
+}
+
+// ── SearchMessages ───────────────────────────────────────────────────────────
+
+func (s *ChatServer) SearchMessages(ctx context.Context, req *pb.SearchMessagesRequest) (*pb.SearchMessagesResponse, error) {
+	if req.GetConversationId() == "" || req.GetQuery() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and query are required")
+	}
+	if s.msgRepo == nil {
+		return &pb.SearchMessagesResponse{}, nil
+	}
+	msgs, err := s.msgRepo.SearchMessages(ctx, req.GetConversationId(), req.GetQuery(), int(req.GetLimit()))
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "search messages: %v", err)
+	}
+	return &pb.SearchMessagesResponse{Messages: msgs}, nil
+}
+
+// ── DeleteMessage ─────────────────────────────────────────────────────────────
+
+func (s *ChatServer) DeleteMessage(ctx context.Context, req *pb.DeleteMessageRequest) (*pb.DeleteMessageResponse, error) {
+	if req.GetMessageId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "message_id and user_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	deleted, err := s.msgRepo.SoftDeleteMessageByOwner(ctx, req.GetMessageId(), req.GetUserId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "delete message: %v", err)
+	}
+	if deleted {
+		convID := normalizeRoomID(req.GetConversationId())
+		if convID != "" {
+			s.hub.Broadcast(ctx, &pb.ServerMessage{
+				RoomId:    convID,
+				UserId:    req.GetUserId(),
+				MessageId: req.GetMessageId(),
+				EventType: pb.EventType_EVENT_TYPE_DELETE,
+				IsDeleted: true,
+			}, true)
+		}
+	}
+	return &pb.DeleteMessageResponse{Success: deleted}, nil
+}
+
+// ── EditMessage ───────────────────────────────────────────────────────────────
+
+func (s *ChatServer) EditMessage(ctx context.Context, req *pb.EditMessageRequest) (*pb.EditMessageResponse, error) {
+	if req.GetMessageId() == "" || req.GetUserId() == "" || req.GetNewContent() == "" {
+		return nil, status.Error(codes.InvalidArgument, "message_id, user_id, and new_content are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	editedAt, err := s.msgRepo.EditMessage(ctx, req.GetMessageId(), req.GetUserId(), req.GetNewContent())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "edit message: %v", err)
+	}
+
+	convID := normalizeRoomID(req.GetConversationId())
+	sm := &pb.ServerMessage{
+		RoomId:         convID,
+		UserId:         req.GetUserId(),
+		MessageId:      req.GetMessageId(),
+		Text:           req.GetNewContent(),
+		EventType:      pb.EventType_EVENT_TYPE_EDIT,
+		EditedAtUnixMs: editedAt,
+	}
+	if convID != "" {
+		s.hub.Broadcast(ctx, sm, true)
+	}
+	return &pb.EditMessageResponse{Message: sm}, nil
+}
+
+// ── MarkMessageRead ───────────────────────────────────────────────────────────
+
+func (s *ChatServer) MarkMessageRead(ctx context.Context, req *pb.MarkMessageReadRequest) (*pb.MarkMessageReadResponse, error) {
+	if req.GetConversationId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and user_id are required")
+	}
+	if s.msgRepo != nil {
+		_ = s.msgRepo.MarkMessageRead(ctx, req.GetConversationId(), req.GetUserId(), req.GetMessageId())
+	}
+	return &pb.MarkMessageReadResponse{Success: true}, nil
+}
+
+// ── GetUnreadCount ────────────────────────────────────────────────────────────
+
+func (s *ChatServer) GetUnreadCount(ctx context.Context, req *pb.GetUnreadCountRequest) (*pb.GetUnreadCountResponse, error) {
+	if req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id is required")
+	}
+	if s.msgRepo == nil {
+		return &pb.GetUnreadCountResponse{TotalUnreadCount: 0}, nil
+	}
+	count, err := s.msgRepo.GetUnreadCount(ctx, req.GetUserId(), req.GetConversationId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get unread count: %v", err)
+	}
+	return &pb.GetUnreadCountResponse{TotalUnreadCount: count}, nil
+}
+
+// ── Group Management RPCs ─────────────────────────────────────────────────────
+
+func (s *ChatServer) CreateGroup(ctx context.Context, req *pb.CreateGroupRequest) (*pb.CreateGroupResponse, error) {
+	if req.GetGroupName() == "" || req.GetCreatedBy() == "" {
+		return nil, status.Error(codes.InvalidArgument, "group_name and created_by are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	conv, err := s.msgRepo.CreateGroupConversation(ctx, req.GetGroupName(), req.GetGroupPhoto(), req.GetDescription(), req.GetCreatedBy(), req.GetMemberIds())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "create group: %v", err)
+	}
+	return &pb.CreateGroupResponse{Conversation: conv}, nil
+}
+
+func (s *ChatServer) AddGroupMember(ctx context.Context, req *pb.AddGroupMemberRequest) (*pb.AddGroupMemberResponse, error) {
+	if req.GetConversationId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and user_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.AddGroupMember(ctx, req.GetConversationId(), req.GetUserId(), req.GetOperatorId(), req.GetRole())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "add group member: %v", err)
+	}
+	return &pb.AddGroupMemberResponse{Success: true}, nil
+}
+
+func (s *ChatServer) RemoveGroupMember(ctx context.Context, req *pb.RemoveGroupMemberRequest) (*pb.RemoveGroupMemberResponse, error) {
+	if req.GetConversationId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and user_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.RemoveGroupMember(ctx, req.GetConversationId(), req.GetUserId(), req.GetOperatorId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "remove group member: %v", err)
+	}
+	return &pb.RemoveGroupMemberResponse{Success: true}, nil
+}
+
+func (s *ChatServer) LeaveGroup(ctx context.Context, req *pb.LeaveGroupRequest) (*pb.LeaveGroupResponse, error) {
+	if req.GetConversationId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and user_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.LeaveGroup(ctx, req.GetConversationId(), req.GetUserId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "leave group: %v", err)
+	}
+	return &pb.LeaveGroupResponse{Success: true}, nil
+}
+
+func (s *ChatServer) PromoteAdmin(ctx context.Context, req *pb.PromoteAdminRequest) (*pb.PromoteAdminResponse, error) {
+	if req.GetConversationId() == "" || req.GetUserId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and user_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.PromoteAdmin(ctx, req.GetConversationId(), req.GetUserId(), req.GetOperatorId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "promote admin: %v", err)
+	}
+	return &pb.PromoteAdminResponse{Success: true}, nil
+}
+
+func (s *ChatServer) TransferOwnership(ctx context.Context, req *pb.TransferOwnershipRequest) (*pb.TransferOwnershipResponse, error) {
+	if req.GetConversationId() == "" || req.GetNewOwnerId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and new_owner_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.TransferOwnership(ctx, req.GetConversationId(), req.GetCurrentOwnerId(), req.GetNewOwnerId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "transfer ownership: %v", err)
+	}
+	return &pb.TransferOwnershipResponse{Success: true}, nil
+}
+
+func (s *ChatServer) DeleteGroup(ctx context.Context, req *pb.DeleteGroupRequest) (*pb.DeleteGroupResponse, error) {
+	if req.GetConversationId() == "" || req.GetOwnerId() == "" {
+		return nil, status.Error(codes.InvalidArgument, "conversation_id and owner_id are required")
+	}
+	if s.msgRepo == nil {
+		return nil, status.Error(codes.Unimplemented, "message repo not configured")
+	}
+	err := s.msgRepo.DeleteGroup(ctx, req.GetConversationId(), req.GetOwnerId())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "delete group: %v", err)
+	}
+	return &pb.DeleteGroupResponse{Success: true}, nil
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
+
 
 
 func normalizeRoomID(roomID string) string {

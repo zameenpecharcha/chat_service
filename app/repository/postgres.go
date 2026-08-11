@@ -49,9 +49,11 @@ func (r *RoomRepository) Close() error { return r.db.Close() }
 
 // Migrate creates the chat schema tables if they don't exist yet.
 // Idempotent — safe to call on every startup.
+// Tables are created in public to avoid search_path / Neon pooler surprises.
 func (r *RoomRepository) Migrate(ctx context.Context) error {
-	_, err := r.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS chat_rooms (
+	stmts := []string{
+		`CREATE SCHEMA IF NOT EXISTS public`,
+		`CREATE TABLE IF NOT EXISTS public.chat_rooms (
 			id              TEXT         PRIMARY KEY,
 			room_type       SMALLINT     NOT NULL DEFAULT 0,
 			name            TEXT,
@@ -61,10 +63,9 @@ func (r *RoomRepository) Migrate(ctx context.Context) error {
 			is_archived     BOOLEAN      NOT NULL DEFAULT FALSE,
 			created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-		);
-
-		CREATE TABLE IF NOT EXISTS chat_room_members (
-			room_id         TEXT         NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
+		)`,
+		`CREATE TABLE IF NOT EXISTS public.chat_room_members (
+			room_id         TEXT         NOT NULL REFERENCES public.chat_rooms(id) ON DELETE CASCADE,
 			user_id         TEXT         NOT NULL CHECK (user_id <> ''),
 			role            TEXT         NOT NULL DEFAULT 'member',
 			joined_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -72,47 +73,43 @@ func (r *RoomRepository) Migrate(ctx context.Context) error {
 			muted_until     TIMESTAMPTZ,
 			is_pinned       BOOLEAN      NOT NULL DEFAULT FALSE,
 			PRIMARY KEY (room_id, user_id)
-		);
-
-		CREATE TABLE IF NOT EXISTS chat_room_last_activity (
-			room_id          TEXT         PRIMARY KEY REFERENCES chat_rooms(id) ON DELETE CASCADE,
+		)`,
+		`CREATE TABLE IF NOT EXISTS public.chat_room_last_activity (
+			room_id          TEXT         PRIMARY KEY REFERENCES public.chat_rooms(id) ON DELETE CASCADE,
 			last_message_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 			last_message_id  TEXT,
 			last_sender_id   TEXT,
 			preview_text     TEXT
-		);
-
-		CREATE TABLE IF NOT EXISTS chat_read_receipts (
-			room_id          TEXT         NOT NULL REFERENCES chat_rooms(id) ON DELETE CASCADE,
+		)`,
+		`CREATE TABLE IF NOT EXISTS public.chat_read_receipts (
+			room_id          TEXT         NOT NULL REFERENCES public.chat_rooms(id) ON DELETE CASCADE,
 			user_id          TEXT         NOT NULL CHECK (user_id <> ''),
 			last_read_at     TIMESTAMPTZ  NOT NULL,
 			last_read_msg_id TEXT,
 			PRIMARY KEY (room_id, user_id)
-		);
-
-		-- Indexes
-		CREATE INDEX IF NOT EXISTS idx_chat_rooms_created_by
-			ON chat_rooms(created_by);
-		CREATE INDEX IF NOT EXISTS idx_chat_members_user
-			ON chat_room_members(user_id) WHERE left_at IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_last_activity_time
-			ON chat_room_last_activity(last_message_at DESC);
-
-		-- Trigger: keep updated_at current on every UPDATE
-		CREATE OR REPLACE FUNCTION trg_set_updated_at()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_rooms_created_by ON public.chat_rooms(created_by)`,
+		`CREATE INDEX IF NOT EXISTS idx_chat_members_user ON public.chat_room_members(user_id) WHERE left_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_last_activity_time ON public.chat_room_last_activity(last_message_at DESC)`,
+		`CREATE OR REPLACE FUNCTION public.trg_set_updated_at()
 		RETURNS TRIGGER LANGUAGE plpgsql AS $trg$
 		BEGIN
 			NEW.updated_at = NOW();
 			RETURN NEW;
 		END;
-		$trg$;
-
-		DROP TRIGGER IF EXISTS set_chat_rooms_updated_at ON chat_rooms;
-		CREATE TRIGGER set_chat_rooms_updated_at
-			BEFORE UPDATE ON chat_rooms
-			FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
-	`)
-	return err
+		$trg$`,
+		`DROP TRIGGER IF EXISTS set_chat_rooms_updated_at ON public.chat_rooms`,
+		// EXECUTE PROCEDURE works on PG11–16; FUNCTION is PG14+ alias.
+		`CREATE TRIGGER set_chat_rooms_updated_at
+			BEFORE UPDATE ON public.chat_rooms
+			FOR EACH ROW EXECUTE PROCEDURE public.trg_set_updated_at()`,
+	}
+	for _, stmt := range stmts {
+		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migrate: %w\nstmt: %s", err, stmt)
+		}
+	}
+	return nil
 }
 
 // UpsertRoom inserts a room row (idempotent — ON CONFLICT DO NOTHING).

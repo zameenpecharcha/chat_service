@@ -237,19 +237,7 @@ func (r *MessageRepository) CreateOrGetDirectConversation(ctx context.Context, u
 	}
 	participants := []string{userA, userB}
 	sort.Strings(participants)
-
-	// Check if conversation exists
-	filter := bson.M{
-		"type":         "DIRECT",
-		"participants": participants,
-	}
-	var existing conversationDoc
-	err := r.conversations.FindOne(ctx, filter).Decode(&existing)
-	if err == nil {
-		return docToConversationDetail(&existing), nil
-	}
-
-	convID := fmt.Sprintf("CONV_%s_%s", participants[0], participants[1])
+	convID := fmt.Sprintf("dm:%s:%s", participants[0], participants[1])
 	now := time.Now().UTC()
 	doc := conversationDoc{
 		ID:           convID,
@@ -257,6 +245,27 @@ func (r *MessageRepository) CreateOrGetDirectConversation(ctx context.Context, u
 		Participants: participants,
 		CreatedBy:    createdBy,
 		CreatedAt:    now,
+	}
+
+	// Check if conversation exists for this pair (may still be legacy CONV_*).
+	filter := bson.M{
+		"type":         "DIRECT",
+		"participants": participants,
+	}
+	var existing conversationDoc
+	err := r.conversations.FindOne(ctx, filter).Decode(&existing)
+	if err == nil {
+		detail := docToConversationDetail(&existing)
+		// Always return the canonical dm:* id so list/create/persist stay aligned with Postgres.
+		detail.ConversationId = convID
+		if existing.ID != convID {
+			_, _ = r.conversations.UpdateOne(ctx,
+				bson.M{"_id": convID},
+				bson.M{"$setOnInsert": doc},
+				options.UpdateOne().SetUpsert(true),
+			)
+		}
+		return detail, nil
 	}
 
 	_, err = r.conversations.InsertOne(ctx, doc)
@@ -707,8 +716,12 @@ func (r *MessageRepository) GetMessages(ctx context.Context, roomID string, limi
 	if limit <= 0 {
 		limit = 50
 	}
+	ids := roomIDAliases(roomID)
 	return r.queryMessages(ctx,
-		bson.M{"$or": bson.A{bson.M{"conversation_id": roomID}, bson.M{"room_id": roomID}}},
+		bson.M{"$or": bson.A{
+			bson.M{"conversation_id": bson.M{"$in": ids}},
+			bson.M{"room_id": bson.M{"$in": ids}},
+		}},
 		limit,
 	)
 }
@@ -721,10 +734,14 @@ func (r *MessageRepository) GetMessagesBefore(ctx context.Context, roomID string
 		return r.GetMessages(ctx, roomID, limit, 0)
 	}
 	t := time.UnixMilli(beforeUnixMs).UTC()
+	ids := roomIDAliases(roomID)
 	return r.queryMessages(ctx,
 		bson.M{
 			"$and": bson.A{
-				bson.M{"$or": bson.A{bson.M{"conversation_id": roomID}, bson.M{"room_id": roomID}}},
+				bson.M{"$or": bson.A{
+					bson.M{"conversation_id": bson.M{"$in": ids}},
+					bson.M{"room_id": bson.M{"$in": ids}},
+				}},
 				bson.M{"$or": bson.A{bson.M{"created_at": bson.M{"$lt": t}}, bson.M{"sent_at": bson.M{"$lt": t}}}},
 			},
 		},
@@ -924,4 +941,52 @@ func splitRoomID(roomID string) []string {
 		return nil
 	}
 	return []string{rest[:sep], rest[sep+1:]}
+}
+
+// roomIDAliases returns the canonical room id plus legacy CONV_* / unsorted forms
+// so history written under the old scheme is still readable.
+func roomIDAliases(roomID string) []string {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return nil
+	}
+	seen := map[string]struct{}{roomID: {}}
+	out := []string{roomID}
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+
+	canonicalDM := func(a, b string) {
+		if a == "" || b == "" {
+			return
+		}
+		ids := []string{a, b}
+		sort.Strings(ids)
+		add(fmt.Sprintf("dm:%s:%s", ids[0], ids[1]))
+		add(fmt.Sprintf("CONV_%s_%s", ids[0], ids[1]))
+		add(fmt.Sprintf("CONV_%s_%s", a, b))
+		add(fmt.Sprintf("CONV_%s_%s", b, a))
+	}
+
+	if strings.HasPrefix(roomID, "dm:") {
+		parts := strings.Split(roomID, ":")
+		if len(parts) >= 3 {
+			canonicalDM(parts[1], strings.Join(parts[2:], ":"))
+		}
+	} else if strings.HasPrefix(roomID, "CONV_") {
+		rest := strings.TrimPrefix(roomID, "CONV_")
+		// UUIDs are 36 chars; legacy id is CONV_<uuid>_<uuid>
+		if len(rest) >= 73 && rest[36] == '_' {
+			canonicalDM(rest[:36], rest[37:])
+		}
+	}
+	return out
 }

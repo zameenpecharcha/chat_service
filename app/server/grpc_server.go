@@ -255,7 +255,7 @@ func (s *ChatServer) processIncoming(ctx context.Context, in *pb.ClientMessage) 
 	}
 }
 
-// persistMessage saves to Cassandra + updates Postgres last-activity (async).
+// persistMessage saves to Mongo + updates Postgres last-activity (async).
 func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) {
 	if s.msgRepo == nil && s.pgRooms == nil {
 		return
@@ -263,7 +263,10 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 	go func() {
 		bg := context.Background()
 		if s.msgRepo != nil {
-			_ = s.msgRepo.SaveMessage(bg, msg)
+			if err := s.msgRepo.SaveMessage(bg, msg); err != nil {
+				log.Printf("[chat-service] SaveMessage room=%s msg=%s err=%v",
+					msg.GetRoomId(), msg.GetMessageId(), err)
+			}
 		}
 		if s.pgRooms != nil {
 			preview := msg.GetText()
@@ -300,7 +303,7 @@ func (s *ChatServer) persistMessage(ctx context.Context, msg *pb.ServerMessage) 
 // ── GetMessages ───────────────────────────────────────────────────────────────
 
 func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesResponse, error) {
-	roomID := req.GetRoomId()
+	roomID := normalizeRoomID(req.GetRoomId())
 	log.Printf("[chat-service] get messages room=%s user=%s limit=%d before=%d", roomID, req.GetUserId(), req.GetLimit(), req.GetBeforeUnixMs())
 	if roomID == "" {
 		return nil, status.Error(codes.InvalidArgument, "room_id is required")
@@ -317,6 +320,13 @@ func (s *ChatServer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest
 	msgs, err := s.msgRepo.GetMessagesBefore(ctx, roomID, req.GetBeforeUnixMs(), limit+1)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "get messages: %v", err)
+	}
+
+	// Present a single canonical room id to clients.
+	for _, m := range msgs {
+		if m != nil {
+			m.RoomId = roomID
+		}
 	}
 
 	hasMore := len(msgs) > limit
@@ -364,26 +374,37 @@ func (s *ChatServer) CreateRoom(ctx context.Context, req *pb.CreateRoomRequest) 
 		if len(req.GetMemberIds()) != 2 {
 			return nil, status.Error(codes.InvalidArgument, "DM requires exactly 2 member_ids")
 		}
-		if s.msgRepo != nil {
-			conv, err := s.msgRepo.CreateOrGetDirectConversation(ctx, req.GetMemberIds()[0], req.GetMemberIds()[1], req.GetCreatedBy())
-			if err == nil {
-				return &pb.CreateRoomResponse{RoomId: conv.ConversationId, Name: ""}, nil
-			}
-		}
+		userA, userB := req.GetMemberIds()[0], req.GetMemberIds()[1]
+		var roomID, name string
+
+		// Canonical DM id lives in Postgres (dm:sortedA:sortedB). Always create/get
+		// there first when available so list + persist + WS use one key.
 		if s.pgRooms != nil {
-			meta, err := s.pgRooms.GetOrCreateDM(ctx,
-				req.GetMemberIds()[0], req.GetMemberIds()[1], req.GetCreatedBy())
+			meta, err := s.pgRooms.GetOrCreateDM(ctx, userA, userB, req.GetCreatedBy())
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "create DM (pg): %v", err)
 			}
+			roomID, name = meta.RoomID, meta.Name
+		}
+
+		// Dual-write Mongo conversation metadata under the same dm:* id.
+		if s.msgRepo != nil {
+			conv, err := s.msgRepo.CreateOrGetDirectConversation(ctx, userA, userB, req.GetCreatedBy())
+			if err != nil {
+				log.Printf("[chat-service] create DM mongo warn: %v", err)
+			} else if roomID == "" {
+				roomID = conv.GetConversationId()
+			}
+		}
+
+		if roomID == "" {
+			meta, err := s.rooms.CreateDM(ctx, userA, userB, req.GetCreatedBy())
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "create DM: %v", err)
+			}
 			return &pb.CreateRoomResponse{RoomId: meta.RoomID, Name: meta.Name}, nil
 		}
-		meta, err := s.rooms.CreateDM(ctx,
-			req.GetMemberIds()[0], req.GetMemberIds()[1], req.GetCreatedBy())
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "create DM: %v", err)
-		}
-		return &pb.CreateRoomResponse{RoomId: meta.RoomID, Name: meta.Name}, nil
+		return &pb.CreateRoomResponse{RoomId: roomID, Name: name}, nil
 
 	case pb.RoomType_ROOM_TYPE_GROUP:
 		if req.GetName() == "" {
@@ -481,19 +502,47 @@ func (s *ChatServer) GetUserRooms(ctx context.Context, req *pb.GetUserRoomsReque
 		return nil, status.Error(codes.InvalidArgument, "user_id is required")
 	}
 
-	// Try Postgres first (has richer metadata: unread flag, group name, etc.)
+	byID := map[string]*pb.UserRoom{}
+	order := make([]string, 0)
+
+	addRoom := func(r *pb.UserRoom) {
+		if r == nil || r.RoomId == "" {
+			return
+		}
+		r.RoomId = normalizeRoomID(r.RoomId)
+		if existing, ok := byID[r.RoomId]; ok {
+			// Prefer richer Postgres metadata; keep the newer last-message stamp.
+			if r.LastMessageAt > existing.LastMessageAt {
+				existing.LastMessage = r.LastMessage
+				existing.LastMessageAt = r.LastMessageAt
+			}
+			if existing.Name == "" && r.Name != "" {
+				existing.Name = r.Name
+			}
+			if len(existing.MemberIds) == 0 && len(r.MemberIds) > 0 {
+				existing.MemberIds = r.MemberIds
+			}
+			if r.HasUnread {
+				existing.HasUnread = true
+			}
+			return
+		}
+		byID[r.RoomId] = r
+		order = append(order, r.RoomId)
+	}
+
+	// Postgres first (richer metadata: unread flag, group name, etc.)
 	if s.pgRooms != nil {
 		rooms, err := s.pgRooms.GetUserRoomsDetailed(ctx, userID)
 		if err != nil {
 			log.Printf("[chat-service] GetUserRooms pg error user=%s: %v", userID, err)
-		} else if len(rooms) > 0 {
-			pbRooms := make([]*pb.UserRoom, 0, len(rooms))
+		} else {
 			for _, r := range rooms {
 				rt := pb.RoomType_ROOM_TYPE_DM
 				if r.RoomType == 1 {
 					rt = pb.RoomType_ROOM_TYPE_GROUP
 				}
-				pbRooms = append(pbRooms, &pb.UserRoom{
+				addRoom(&pb.UserRoom{
 					RoomId:        r.RoomID,
 					RoomType:      rt,
 					Name:          r.Name,
@@ -503,39 +552,39 @@ func (s *ChatServer) GetUserRooms(ctx context.Context, req *pb.GetUserRoomsReque
 					MemberIds:     r.MemberIDs,
 				})
 			}
-			return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
 		}
 	}
 
-	// Fallback: query MongoDB messages directly for rooms this user participated in.
-	// This covers the case where pgRooms is nil or Postgres tables are empty.
-	if s.msgRepo == nil {
-		return &pb.GetUserRoomsResponse{}, nil
-	}
-
-	summaries, err := s.msgRepo.GetUserRooms(ctx, userID)
-	if err != nil {
-		log.Printf("[chat-service] GetUserRooms mongo error user=%s: %v", userID, err)
-		return &pb.GetUserRoomsResponse{}, nil
-	}
-
-	pbRooms := make([]*pb.UserRoom, 0, len(summaries))
-	for _, r := range summaries {
-		rt := pb.RoomType_ROOM_TYPE_DM
-		if len(r.RoomID) > 6 && r.RoomID[:6] == "group:" {
-			rt = pb.RoomType_ROOM_TYPE_GROUP
+	// Merge Mongo conversations so legacy CONV_* DMs still appear, remapped to dm:*.
+	if s.msgRepo != nil {
+		summaries, err := s.msgRepo.GetUserRooms(ctx, userID)
+		if err != nil {
+			log.Printf("[chat-service] GetUserRooms mongo error user=%s: %v", userID, err)
+		} else {
+			for _, r := range summaries {
+				rt := pb.RoomType_ROOM_TYPE_DM
+				id := normalizeRoomID(r.RoomID)
+				if strings.HasPrefix(id, "group:") || (len(r.RoomID) > 6 && r.RoomID[:6] == "group:") {
+					rt = pb.RoomType_ROOM_TYPE_GROUP
+				}
+				addRoom(&pb.UserRoom{
+					RoomId:        id,
+					RoomType:      rt,
+					Name:          "",
+					LastMessage:   r.LastMessage,
+					LastMessageAt: r.LastMessageAt.UnixMilli(),
+					HasUnread:     false,
+					MemberIds:     r.MemberIDs,
+				})
+			}
 		}
-		pbRooms = append(pbRooms, &pb.UserRoom{
-			RoomId:        r.RoomID,
-			RoomType:      rt,
-			Name:          "",
-			LastMessage:   r.LastMessage,
-			LastMessageAt: r.LastMessageAt.UnixMilli(),
-			HasUnread:     false,
-			MemberIds:     r.MemberIDs,
-		})
 	}
-	log.Printf("[chat-service] GetUserRooms mongo fallback user=%s rooms=%d", userID, len(pbRooms))
+
+	pbRooms := make([]*pb.UserRoom, 0, len(order))
+	for _, id := range order {
+		pbRooms = append(pbRooms, byID[id])
+	}
+	log.Printf("[chat-service] GetUserRooms user=%s rooms=%d", userID, len(pbRooms))
 	return &pb.GetUserRoomsResponse{Rooms: pbRooms}, nil
 }
 
@@ -817,11 +866,20 @@ func normalizeRoomID(roomID string) string {
 	if strings.HasPrefix(roomID, "dm:") {
 		parts := strings.Split(roomID, ":")
 		if len(parts) >= 3 && parts[1] != "" && parts[2] != "" {
-			ids := []string{parts[1], parts[2]}
+			ids := []string{parts[1], strings.Join(parts[2:], ":")}
 			if ids[0] != "" && ids[1] != "" {
 				sort.Strings(ids)
 				return fmt.Sprintf("dm:%s:%s", ids[0], ids[1])
 			}
+		}
+	}
+	// Legacy Mongo DM ids: CONV_<uuid>_<uuid> → canonical dm:sortedA:sortedB
+	if strings.HasPrefix(roomID, "CONV_") {
+		rest := strings.TrimPrefix(roomID, "CONV_")
+		if len(rest) >= 73 && rest[36] == '_' {
+			ids := []string{rest[:36], rest[37:]}
+			sort.Strings(ids)
+			return fmt.Sprintf("dm:%s:%s", ids[0], ids[1])
 		}
 	}
 	return roomID
